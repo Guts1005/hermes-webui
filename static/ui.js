@@ -4018,7 +4018,8 @@ function syncModelChip(){
   const text=opt?opt.textContent:getModelLabel(sel.value||'');
   const compactText=_compactComposerModelChipLabel(sel.value||'', text);
   const gatewayRouting=_latestGatewayRoutingForSession(S.session);
-  const displayText=_formatGatewayModelLabel(sel.value||'',compactText,gatewayRouting)||compactText;
+  const fallbackText=(S.session&&S.session.last_used_model)?_compactComposerModelChipLabel(S.session.last_used_model,getModelLabel(S.session.last_used_model)):compactText;
+  const displayText=_formatGatewayModelLabel(sel.value||'',compactText,gatewayRouting)||fallbackText;
   label.textContent=displayText;
   if(mobileLabel) mobileLabel.textContent=displayText;
   chip.title=gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model');

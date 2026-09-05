@@ -10706,6 +10706,7 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = (
 )
 
 
+
 def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None = None) -> dict:
     """Return the bounded /api/sessions row shape used by the sidebar.
 
@@ -15405,6 +15406,7 @@ def handle_post(handler, parsed) -> bool:
                 # the duplicate should behave identically.
                 gateway_routing=copy.deepcopy(getattr(session, "gateway_routing", None)),
                 gateway_routing_history=copy.deepcopy(getattr(session, "gateway_routing_history", None) or []),
+                last_used_model=getattr(session, "last_used_model", None),
                 # Preserve LLM-generated title flag so we don't regenerate title on duplicate.
                 llm_title_generated=getattr(session, "llm_title_generated", False),
                 manual_title=getattr(session, "manual_title", False),
@@ -16258,6 +16260,7 @@ def handle_post(handler, parsed) -> bool:
             context_messages=copy.deepcopy(forked_context),
             # Gateway routing — inherit from source
             gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
+            last_used_model=getattr(source, "last_used_model", None),
             # Context engine — inherit state so branch's context engine starts correctly
             context_engine=getattr(source, "context_engine", None),
             context_engine_state=copy.deepcopy(getattr(source, "context_engine_state", None) or {}),
@@ -23773,6 +23776,7 @@ def _handle_session_compression_recovery_start(handler, body):
                 threshold_tokens=getattr(source, "threshold_tokens", None),
                 gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
                 gateway_routing_history=copy.deepcopy(getattr(source, "gateway_routing_history", None) or []),
+                last_used_model=getattr(source, "last_used_model", None),
                 parent_session_id=getattr(source, "session_id", sid),
                 worktree_path=getattr(source, "worktree_path", None),
                 worktree_branch=getattr(source, "worktree_branch", None),

@@ -11947,6 +11947,8 @@ def _run_agent_streaming(
                 # resolved_model would mis-attribute exactly the turns where
                 # attribution matters most.
                 _used_model = getattr(agent, 'model', None) or resolved_model or model
+                if _used_model:
+                    s.last_used_model = str(_used_model).strip()[:240]
                 if _gateway_routing:
                     s.gateway_routing = _gateway_routing
                     _history = list(getattr(s, 'gateway_routing_history', None) or [])
