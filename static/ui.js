@@ -4018,15 +4018,16 @@ function syncModelChip(){
   const text=opt?opt.textContent:getModelLabel(sel.value||'');
   const compactText=_compactComposerModelChipLabel(sel.value||'', text);
   const gatewayRouting=_latestGatewayRoutingForSession(S.session);
-  // ponytail: live manual dropdown pick takes precedence over historical served model
+  // ponytail: live manual dropdown pick takes precedence over historical routing/fallback
   const manualPick = String(sel.value||'') !== String((S.session&&S.session.model)||'');
+  const activeRouting = manualPick ? null : gatewayRouting;
   const fallbackText = (!manualPick && S.session && S.session.last_used_model)
     ? _compactComposerModelChipLabel(S.session.last_used_model, getModelLabel(S.session.last_used_model))
     : compactText;
-  const displayText=_formatGatewayModelLabel(sel.value||'',compactText,gatewayRouting)||fallbackText;
+  const displayText=_formatGatewayModelLabel(sel.value||'',compactText,activeRouting)||fallbackText;
   label.textContent=displayText;
   if(mobileLabel) mobileLabel.textContent=displayText;
-  chip.title=gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model');
+  chip.title=activeRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(activeRouting)}`:(sel.value||'Conversation model');
   chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
   if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
 }

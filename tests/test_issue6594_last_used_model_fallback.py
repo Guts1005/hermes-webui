@@ -80,8 +80,10 @@ def test_frontend_formatters_resolve_precedence():
 
 
 def test_composer_chip_manual_pick_overrides_last_used_model():
-    """Manual dropdown pick takes precedence over historical fallback."""
+    """Manual dropdown pick takes precedence over historical fallback and routing."""
     assert "manualPick" in UI_JS
     assert "!manualPick&&S.session&&S.session.last_used_model" in UI_JS.replace(" ", "")
+    assert "activeRouting=manualPick?null:gatewayRouting" in UI_JS.replace(" ", "")
+    assert "_formatGatewayModelLabel(sel.value||'',compactText,activeRouting)" in UI_JS.replace(" ", "")
 
 
