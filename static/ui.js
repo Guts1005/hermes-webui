@@ -4018,7 +4018,11 @@ function syncModelChip(){
   const text=opt?opt.textContent:getModelLabel(sel.value||'');
   const compactText=_compactComposerModelChipLabel(sel.value||'', text);
   const gatewayRouting=_latestGatewayRoutingForSession(S.session);
-  const fallbackText=(S.session&&S.session.last_used_model)?_compactComposerModelChipLabel(S.session.last_used_model,getModelLabel(S.session.last_used_model)):compactText;
+  // ponytail: live manual dropdown pick takes precedence over historical served model
+  const manualPick = String(sel.value||'') !== String((S.session&&S.session.model)||'');
+  const fallbackText = (!manualPick && S.session && S.session.last_used_model)
+    ? _compactComposerModelChipLabel(S.session.last_used_model, getModelLabel(S.session.last_used_model))
+    : compactText;
   const displayText=_formatGatewayModelLabel(sel.value||'',compactText,gatewayRouting)||fallbackText;
   label.textContent=displayText;
   if(mobileLabel) mobileLabel.textContent=displayText;
