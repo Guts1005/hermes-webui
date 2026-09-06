@@ -422,7 +422,7 @@ function _formatSessionModelWithGateway(s){
   const routing=(typeof _latestGatewayRoutingForSession==='function')?_latestGatewayRoutingForSession(s):(s.gateway_routing||null);
   const fallbackModel=s.last_used_model||s.model;
   if(typeof _formatGatewayModelLabel==='function'){
-    return _formatGatewayModelLabel(s.model,s.model,routing)||getModelLabel(fallbackModel);
+    return _formatGatewayModelLabel(fallbackModel,getModelLabel(fallbackModel),routing)||getModelLabel(fallbackModel);
   }
   return fallbackModel;
 }

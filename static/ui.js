@@ -4021,13 +4021,14 @@ function syncModelChip(){
   // ponytail: live manual dropdown pick takes precedence over historical routing/fallback
   const manualPick = String(sel.value||'') !== String((S.session&&S.session.model)||'');
   const activeRouting = manualPick ? null : gatewayRouting;
+  const fallbackModel = (!manualPick && S.session && S.session.last_used_model) ? S.session.last_used_model : (sel.value || '');
   const fallbackText = (!manualPick && S.session && S.session.last_used_model)
     ? _compactComposerModelChipLabel(S.session.last_used_model, getModelLabel(S.session.last_used_model))
     : compactText;
-  const displayText=_formatGatewayModelLabel(sel.value||'',compactText,activeRouting)||fallbackText;
+  const displayText=_formatGatewayModelLabel(fallbackModel,fallbackText,activeRouting)||fallbackText;
   label.textContent=displayText;
   if(mobileLabel) mobileLabel.textContent=displayText;
-  chip.title=activeRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(activeRouting)}`:(sel.value||'Conversation model');
+  chip.title=activeRouting?`${fallbackModel||'Conversation model'} ${_gatewayRoutingLabel(activeRouting)}`:(fallbackModel||'Conversation model');
   chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
   if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
 }
