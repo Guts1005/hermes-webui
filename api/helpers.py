@@ -1618,6 +1618,10 @@ def _redact_session_cache_rules_key() -> str | None:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
+_DELETED_REDACTION_SESSIONS: set[str] = set()
+_DELETED_REDACTION_LOCK = threading.RLock()
+
+
 def _redact_session_cache_path(session_id):
     # session_id is interpolated into a filename — reject traversal shapes.
     if (not isinstance(session_id, str) or not session_id
@@ -1681,9 +1685,8 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
         # A valid rules_key is a HARD prerequisite for authorizing a cached read.
         # If no trustworthy content identity could be computed (rules_key is
         # None), do not even open the cache: rederive the projection from the
-        # current policy. This is the fail-closed branch the stale-redaction
-        # boundary requires — metadata/version identity is not content identity.
-        if rules_key is not None and path.exists():
+        # current policy.
+        if rules_key is not None and path is not None and path.exists():
             try:
                 loaded = _json.loads(path.read_text(encoding="utf-8"))
                 if (isinstance(loaded, dict)
@@ -1719,7 +1722,7 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
                     projected[i] = _redact_messages([item], _enabled=_enabled)[0]
             projected_by_key[key] = projected
             out[key] = projected
-            if reused != len(digests):
+            if reused != len(digests) or (isinstance(old_digests, list) and len(old_digests) > len(digests)):
                 wrote = True
         if wrote and path is not None and rules_key is not None:
             # Write DECORATION-FREE projections (must happen before the
@@ -1733,12 +1736,20 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
             }
             try:
                 import tempfile
+                sid_str = str(session_id)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.stem}.", suffix=".tmp")
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fh.write(_json.dumps(payload, ensure_ascii=False))
-                    os.replace(tmp_name, path)
+                    with _DELETED_REDACTION_LOCK:
+                        if sid_str not in _DELETED_REDACTION_SESSIONS:
+                            os.replace(tmp_name, path)
+                            if sid_str in _DELETED_REDACTION_SESSIONS:
+                                try:
+                                    path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                 finally:
                     if os.path.exists(tmp_name):
                         os.unlink(tmp_name)
@@ -1773,6 +1784,7 @@ def delete_redaction_session_cache(session_id) -> bool:
     missing projection file are a no-op for the on-disk artifact; returns True
     only if a file was actually removed. Best-effort — never raises.
     """
+    sid_str = str(session_id)
     try:
         path = _redact_session_cache_path(session_id)
     except Exception:
@@ -1784,6 +1796,10 @@ def delete_redaction_session_cache(session_id) -> bool:
     except Exception:
         pass
     try:
+        with _DELETED_REDACTION_LOCK:
+            _DELETED_REDACTION_SESSIONS.add(sid_str)
+            if len(_DELETED_REDACTION_SESSIONS) > 10000:
+                _DELETED_REDACTION_SESSIONS.clear()
         if not path.exists():
             return False
         path.unlink(missing_ok=True)

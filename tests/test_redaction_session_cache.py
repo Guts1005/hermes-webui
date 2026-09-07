@@ -158,9 +158,48 @@ def test_truncation_serves_matching_prefix(state_dir, monkeypatch):
     ]
     redact_session_lists_cached("sessTrunc", {"messages": msgs})
     assert calls["n"] == 3
+    cache_file = state_dir / "redaction_cache" / "sessTrunc.json"
+    stored_before = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert len(stored_before["lists"]["messages"]) == 3
+
     out = redact_session_lists_cached("sessTrunc", {"messages": msgs[:2]})
     assert calls["n"] == 3  # prefix spliced, nothing recomputed
     assert [m["content"] for m in out["messages"]] == ["keep one", "keep two"]
+
+    # Regression (#7452 review): truncation to a full prefix must overwrite on-disk projection
+    stored_after = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert len(stored_after["lists"]["messages"]) == 2
+    assert len(stored_after["digests"]["messages"]) == 2
+    assert [m["content"] for m in stored_after["lists"]["messages"]] == ["keep one", "keep two"]
+
+
+def test_get_vs_delete_race_never_republishes_deleted_session_projection(state_dir, monkeypatch):
+    import os
+    from api.helpers import _redact_session_cache_path
+
+    # Initial session and populated cache
+    msgs = _msgs()
+    redact_session_lists_cached("sessRace", {"messages": msgs})
+    path = _redact_session_cache_path("sessRace")
+    assert path.exists()
+
+    # Interleave a delete immediately before os.replace in redact_session_lists_cached
+    real_replace = os.replace
+
+    def racing_replace(src, dst):
+        if "sessRace" in str(dst):
+            # Concurrent delete fires before the prepared tmp is published
+            delete_redaction_session_cache("sessRace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", racing_replace)
+
+    # Trigger write path with modified messages
+    msgs_new = _msgs() + [{"role": "user", "content": "racing message"}]
+    redact_session_lists_cached("sessRace", {"messages": msgs_new})
+
+    # The projection must NOT be republished for the deleted session
+    assert not path.exists()
 
 
 def test_delete_removes_cache_file_leaves_sibling_intact(state_dir):
