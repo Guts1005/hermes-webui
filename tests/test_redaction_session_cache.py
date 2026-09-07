@@ -220,6 +220,86 @@ def test_recreated_session_can_populate_cache_after_delete(state_dir):
     assert [m["content"] for m in cached["lists"]["messages"]] == ["hello newly created session"]
 
 
+def test_real_thread_deletion_during_prepublication_redaction_never_republishes(state_dir, monkeypatch):
+    import threading
+    from api.helpers import _redact_session_cache_path, _redact_messages
+
+    sid = "sessThreadPrepub"
+    path = _redact_session_cache_path(sid)
+
+    # Populate initial cache
+    redact_session_lists_cached(sid, {"messages": _msgs()})
+    assert path.exists()
+
+    # Intercept pre-publication redaction work to trigger a concurrent real-thread delete
+    entered_redaction = threading.Event()
+    delete_done = threading.Event()
+    real_redact_messages = _redact_messages
+
+    def slow_redact_messages(*args, **kwargs):
+        entered_redaction.set()
+        delete_done.wait(timeout=5.0)
+        return real_redact_messages(*args, **kwargs)
+
+    monkeypatch.setattr("api.helpers._redact_messages", slow_redact_messages)
+
+    # Start background writer with modified messages that require cache write
+    new_msgs = _msgs() + [{"role": "user", "content": "in-flight addition"}]
+    writer_thread = threading.Thread(
+        target=redact_session_lists_cached,
+        args=(sid, {"messages": new_msgs}),
+    )
+    writer_thread.start()
+
+    # Wait until background writer enters redaction before publication
+    assert entered_redaction.wait(timeout=5.0)
+
+    # Main thread deletes the session cache while background writer is working
+    assert delete_redaction_session_cache(sid) is True
+    assert not path.exists()
+
+    # Allow background writer to proceed to publication attempt
+    delete_done.set()
+    writer_thread.join(timeout=5.0)
+    assert not writer_thread.is_alive()
+
+    # The stale background writer MUST NOT have republished the deleted session cache
+    assert not path.exists()
+
+    # Positive control: subsequent session recreation publishes properly
+    monkeypatch.setattr("api.helpers._redact_messages", real_redact_messages)
+    out_recreated = redact_session_lists_cached(sid, {"messages": new_msgs})
+    assert path.exists()
+    cached = json.loads(path.read_text(encoding="utf-8"))
+    assert [m["content"] for m in cached["lists"]["messages"]] == [m["content"] for m in out_recreated["messages"]]
+
+
+def test_monotonic_generation_prevents_aba_republication(state_dir):
+    from api.helpers import _REDACTION_SESSION_GEN, _redact_session_cache_path
+
+    sid = "sessMonotonicABA"
+    path = _redact_session_cache_path(sid)
+
+    # Initial token is default 0
+    token_0 = _REDACTION_SESSION_GEN.get(sid, 0)
+    assert token_0 == 0
+
+    # Delete session increments generation
+    delete_redaction_session_cache(sid)
+    token_1 = _REDACTION_SESSION_GEN.get(sid, 0)
+    assert token_1 == 1
+
+    # Simulate repeated deletions/churn; generation must be strictly monotonic
+    for i in range(2, 20):
+        delete_redaction_session_cache(sid)
+        assert _REDACTION_SESSION_GEN.get(sid, 0) == i
+
+    # Old tokens (like token_0) can never match live generation
+    assert _REDACTION_SESSION_GEN.get(sid, 0) > token_0
+    assert not path.exists()
+
+
+
 
 def test_delete_removes_cache_file_leaves_sibling_intact(state_dir):
     # Deleting a session must remove its redaction-cache file (a deleted

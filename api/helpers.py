@@ -1678,9 +1678,13 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
     want = {}
     wrote = False
     path = None
+    start_token = None
     try:
         rules_key = _redact_session_cache_rules_key()
         path = _redact_session_cache_path(session_id)
+        sid_str = str(session_id)
+        with _DELETED_REDACTION_LOCK:
+            start_token = _REDACTION_SESSION_GEN.get(sid_str, 0)
         cache = None
         # A valid rules_key is a HARD prerequisite for authorizing a cached read.
         # If no trustworthy content identity could be computed (rules_key is
@@ -1736,18 +1740,15 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
             }
             try:
                 import tempfile
-                sid_str = str(session_id)
-                with _DELETED_REDACTION_LOCK:
-                    write_gen = _REDACTION_SESSION_GEN.get(sid_str, 0)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.stem}.", suffix=".tmp")
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fh.write(_json.dumps(payload, ensure_ascii=False))
                     with _DELETED_REDACTION_LOCK:
-                        if _REDACTION_SESSION_GEN.get(sid_str, 0) == write_gen:
+                        if start_token is not None and _REDACTION_SESSION_GEN.get(sid_str, 0) == start_token:
                             os.replace(tmp_name, path)
-                            if _REDACTION_SESSION_GEN.get(sid_str, 0) != write_gen:
+                            if _REDACTION_SESSION_GEN.get(sid_str, 0) != start_token:
                                 try:
                                     path.unlink(missing_ok=True)
                                 except Exception:
@@ -1800,8 +1801,6 @@ def delete_redaction_session_cache(session_id) -> bool:
     try:
         with _DELETED_REDACTION_LOCK:
             _REDACTION_SESSION_GEN[sid_str] = _REDACTION_SESSION_GEN.get(sid_str, 0) + 1
-            if len(_REDACTION_SESSION_GEN) > 10000:
-                _REDACTION_SESSION_GEN.clear()
         if not path.exists():
             return False
         path.unlink(missing_ok=True)
