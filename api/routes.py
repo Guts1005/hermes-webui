@@ -15824,6 +15824,9 @@ def handle_post(handler, parsed) -> bool:
                     str(old_model or "") != str(getattr(s, "model", "") or "")
                     or str(old_provider or "") != str(getattr(s, "model_provider", "") or "")
                 ):
+                    s.last_used_model = None
+                    s.gateway_routing = None
+                    s.gateway_routing_history = []
                     s.context_length = _resolve_context_length_for_session_model(
                         getattr(s, "model", None),
                         getattr(s, "model_provider", None),
