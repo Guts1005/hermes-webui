@@ -117,9 +117,19 @@ const S = {{
 
 function _gatewayProviderName(p) {{ return p ? String(p) : ''; }}
 function _compactComposerModelChipLabel(id, label) {{ return label || id; }}
-function getModelLabel(id) {{ return id ? ('Model(' + id + ')') : ''; }}
 function _selectedModelOption() {{ return null; }}
-function _modelStateForSelect(sel, v) {{ return {{ model: v, model_provider: null }}; }}
+let _selectModelProviders = {{}};
+function _modelStateForSelect(sel, v) {{
+  const prov = (sel && sel._selectedProvider !== undefined) ? sel._selectedProvider : (_selectModelProviders[v] || null);
+  return {{ model: v, model_provider: prov }};
+}}
+function _ensureModelOptionInDropdown(v, sel, provider) {{
+  if (sel) {{
+    sel.value = v;
+    sel._selectedProvider = provider || null;
+  }}
+}}
+function getModelLabel(id) {{ return id ? ('Model(' + id + ')') : ''; }}
 function closeModelDropdown() {{}}
 function clearProfileTransitionReasoningContext() {{}}
 function _writePersistedModelState() {{}}
@@ -373,6 +383,66 @@ async function run() {
     sidebar: _formatSessionModelWithGateway(S.session)
   });
 
+  // 5. Test same-model, different-provider route transition with history containing requested_model and requested_provider
+  S.session.model = 'gpt-4o';
+  S.session.model_provider = 'provider-a';
+  S.session.gateway_routing = {
+    used_model: 'gpt-4o-mini',
+    provider: 'provider-a',
+    requested_model: 'gpt-4o',
+    requested_provider: 'provider-a'
+  };
+  S.session.gateway_routing_history = [{
+    used_model: 'gpt-4o-mini',
+    provider: 'provider-a',
+    requested_model: 'gpt-4o',
+    requested_provider: 'provider-a'
+  }];
+  elements.modelSelect.value = 'gpt-4o';
+  elements.modelSelect._selectedProvider = 'provider-a';
+  syncModelChip();
+  log.push({
+    phase: 'provider_route_initial',
+    chip: elements.composerModelLabel.textContent,
+    sidebar: _formatSessionModelWithGateway(S.session)
+  });
+
+  // User selects the same bare model ID 'gpt-4o', but through 'provider-b'
+  await selectModelFromDropdown('gpt-4o', 'provider-b');
+  log.push({
+    phase: 'provider_route_after_switch',
+    chip: elements.composerModelLabel.textContent,
+    sidebar: _formatSessionModelWithGateway(S.session),
+    history_len: S.session.gateway_routing_history.length,
+    model: S.session.model,
+    provider: S.session.model_provider
+  });
+
+  // During next turn in flight
+  syncModelChip();
+  log.push({
+    phase: 'provider_route_turn_in_flight',
+    chip: elements.composerModelLabel.textContent,
+    sidebar: _formatSessionModelWithGateway(S.session)
+  });
+
+  // 6. Test legacy history without requested_provider rejected on explicit provider route
+  S.session.model = 'gpt-4o';
+  S.session.model_provider = 'provider-b';
+  S.session.gateway_routing = null;
+  S.session.gateway_routing_history = [{
+    used_model: 'gpt-4o-mini',
+    provider: 'provider-a',
+    requested_model: 'gpt-4o'
+    // no requested_provider
+  }];
+  syncModelChip();
+  log.push({
+    phase: 'legacy_history_different_provider',
+    chip: elements.composerModelLabel.textContent,
+    sidebar: _formatSessionModelWithGateway(S.session)
+  });
+
   console.log(JSON.stringify(log));
 }
 run();
@@ -402,3 +472,25 @@ run();
     # Phase 6: In-flight turn retains the new model on both surfaces
     assert results["gateway_turn_in_flight"]["chip"] == "Model(claude-3-5-sonnet)"
     assert results["gateway_turn_in_flight"]["sidebar"] == "Model(claude-3-5-sonnet)"
+
+    # Phase 7: Initial state for provider-a routed turn displays failover
+    assert results["provider_route_initial"]["chip"] == "Model(gpt-4o-mini) via provider-a"
+    assert results["provider_route_initial"]["sidebar"] == "Model(gpt-4o-mini) via provider-a"
+
+    # Phase 8: After same-model, different-provider switch:
+    # - history length remains unchanged (1)
+    # - session model_provider is updated to provider-b
+    # - composer and sidebar show newly selected route without provider-a historical failover
+    assert results["provider_route_after_switch"]["history_len"] == 1
+    assert results["provider_route_after_switch"]["model"] == "gpt-4o"
+    assert results["provider_route_after_switch"]["provider"] == "provider-b"
+    assert results["provider_route_after_switch"]["chip"] == "Model(gpt-4o)"
+    assert results["provider_route_after_switch"]["sidebar"] == "Model(gpt-4o)"
+
+    # Phase 9: During in-flight turn, composer and sidebar remain Model(gpt-4o)
+    assert results["provider_route_turn_in_flight"]["chip"] == "Model(gpt-4o)"
+    assert results["provider_route_turn_in_flight"]["sidebar"] == "Model(gpt-4o)"
+
+    # Phase 10: Legacy history without requested_provider rejected when session has explicit provider
+    assert results["legacy_history_different_provider"]["chip"] == "Model(gpt-4o)"
+    assert results["legacy_history_different_provider"]["sidebar"] == "Model(gpt-4o)"
