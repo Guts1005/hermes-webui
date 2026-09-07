@@ -202,6 +202,25 @@ def test_get_vs_delete_race_never_republishes_deleted_session_projection(state_d
     assert not path.exists()
 
 
+def test_recreated_session_can_populate_cache_after_delete(state_dir):
+    from api.helpers import _redact_session_cache_path
+
+    path = _redact_session_cache_path("sessRecreate")
+    redact_session_lists_cached("sessRecreate", {"messages": _msgs()})
+    assert path.exists()
+
+    assert delete_redaction_session_cache("sessRecreate") is True
+    assert not path.exists()
+
+    # When the session is recreated, caching should resume normally
+    new_msgs = [{"role": "user", "content": "hello newly created session"}]
+    redact_session_lists_cached("sessRecreate", {"messages": new_msgs})
+    assert path.exists()
+    cached = json.loads(path.read_text(encoding="utf-8"))
+    assert [m["content"] for m in cached["lists"]["messages"]] == ["hello newly created session"]
+
+
+
 def test_delete_removes_cache_file_leaves_sibling_intact(state_dir):
     # Deleting a session must remove its redaction-cache file (a deleted
     # conversation is not recoverable from redaction_cache/), while an
