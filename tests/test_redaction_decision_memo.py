@@ -95,40 +95,45 @@ def test_byte_budget_lru_eviction_and_accounting():
     # Construct a small ByteBudgetLRU to verify exact byte accounting & eviction
     cache = H.byte_budget_lru_cache(max_bytes=1000, name="test_lru")(lambda s: s)
 
-    overhead = H._ENTRY_CONTAINER_OVERHEAD_BYTES
-
-    # Clean string: key is val -> single accounting plus container overhead
+    # Clean string: key is val -> single payload + tuple overhead + measured dict growth
     s1 = "hello_world_1"
     cache(s1)
-    expected_bytes_s1 = sys.getsizeof(s1) + overhead
+    expected_bytes_s1 = (
+        sys.getsizeof(s1)
+        + H._TUPLE_OVERHEAD_BYTES
+        + (sys.getsizeof(cache._data) - H._BASE_DICT_BYTES)
+    )
     info1 = cache.cache_info()
     assert info1.retained_bytes == expected_bytes_s1
     assert info1.currsize == 1
 
-    # Redacted string: key is not val -> dual accounting plus container overhead
+    # Redacted string: key is not val -> dual payload + tuple overhead + measured dict growth
     cache_redact = H.byte_budget_lru_cache(max_bytes=1000, name="test_redact")(lambda s: s.replace("secret", "xxx"))
     s2 = "this_has_a_secret_here"
     val2 = cache_redact(s2)
-    expected_bytes_s2 = sys.getsizeof(s2) + sys.getsizeof(val2) + overhead
+    expected_bytes_s2 = (
+        sys.getsizeof(s2)
+        + sys.getsizeof(val2)
+        + H._TUPLE_OVERHEAD_BYTES
+        + (sys.getsizeof(cache_redact._data) - H._BASE_DICT_BYTES)
+    )
     info2 = cache_redact.cache_info()
     assert info2.retained_bytes == expected_bytes_s2
     assert info2.currsize == 1
 
-    # Exceeding budget evicts oldest entries (LRU order)
-    # Each 100-char string is ~150B + 128B overhead = ~278B.
-    # Budget of 600B holds exactly 2 entries (~556B) and evicts on the 3rd.
-    tight_cache = H.byte_budget_lru_cache(max_bytes=600, name="tight")(lambda s: s)
+    # Exact 2-entry shape: two 100-char strings = 298B + two 56B tuples = 112B + dict growth = 248B -> exactly 658B
+    # Budget of 700B accommodates exactly 2 entries (658B <= 700B) and evicts on the 3rd.
+    tight_cache = H.byte_budget_lru_cache(max_bytes=700, name="tight")(lambda s: s)
     e1 = "a" * 100
     e2 = "b" * 100
     e3 = "c" * 100
-    cost_e1 = sys.getsizeof(e1) + overhead
-    cost_e2 = sys.getsizeof(e2) + overhead
-    cost_e3 = sys.getsizeof(e3) + overhead
 
     tight_cache(e1)
     tight_cache(e2)
     assert tight_cache.cache_info().currsize == 2
-    assert tight_cache.cache_info().retained_bytes == cost_e1 + cost_e2
+    # Exact shallow growth matches 658 bytes
+    assert tight_cache.cache_info().retained_bytes == 658
+    assert tight_cache.cache_info().retained_bytes <= 700
 
     # Access e1 again to make e2 the LRU
     tight_cache(e1)
@@ -137,8 +142,10 @@ def test_byte_budget_lru_eviction_and_accounting():
     tight_cache(e3)
     info_tight = tight_cache.cache_info()
     assert info_tight.currsize == 2
-    assert info_tight.retained_bytes == cost_e1 + cost_e3
-    assert info_tight.retained_bytes <= 600
+    # Discriminating assertion on surviving keys
+    assert list(tight_cache._data.keys()) == [e1, e3]
+    assert info_tight.retained_bytes == 658
+    assert info_tight.retained_bytes <= 700
 
     # Cache clear resets retained_bytes and currsize
     tight_cache.cache_clear()
@@ -147,6 +154,42 @@ def test_byte_budget_lru_eviction_and_accounting():
     assert cleared_info.retained_bytes == 0
     assert cleared_info.hits == 0
     assert cleared_info.misses == 0
+
+
+def test_byte_budget_lru_resize_boundaries_and_compaction():
+    """Verify shallow accounting across dict resize boundaries and compaction on eviction."""
+    cache = H.byte_budget_lru_cache(max_bytes=50000, name="resize_test")(lambda s: s + "_out")
+
+    # Step across multiple OrderedDict resize boundaries (5, 10, 20, 50, 100 entries)
+    for n in (5, 10, 20, 50, 100):
+        for i in range(len(cache._data), n):
+            cache(f"key_{i:04d}")
+        assert cache.cache_info().currsize == n
+        # Assert exact measured shallow retained bytes matches primary source formula
+        expected_shallow = (
+            sum(sys.getsizeof(k) + sys.getsizeof(v) for k, (v, _) in cache._data.items())
+            + (len(cache._data) * H._TUPLE_OVERHEAD_BYTES)
+            + max(0, sys.getsizeof(cache._data) - H._BASE_DICT_BYTES)
+        )
+        assert cache.cache_info().retained_bytes == expected_shallow
+        assert cache.cache_info().retained_bytes <= 50000
+
+    # Peak: container has grown to high-water mark (>8000 bytes for 100 entries)
+    peak_dict_size = sys.getsizeof(cache._data)
+    assert peak_dict_size >= 8000
+
+    # High-water eviction: reduce max_bytes to 2000 and insert an entry forcing bulk eviction
+    cache.max_bytes = 2000
+    cache("forcing_eviction_key")
+
+    # Verify compaction took place and released table capacity slack
+    compacted_dict_size = sys.getsizeof(cache._data)
+    assert compacted_dict_size < 1500
+    assert compacted_dict_size < peak_dict_size // 4
+    info = cache.cache_info()
+    assert info.retained_bytes <= 2000
+    # Verify latest key survived
+    assert "forcing_eviction_key" in cache._data
 
 
 def test_byte_budget_lru_thread_safety():

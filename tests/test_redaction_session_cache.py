@@ -209,12 +209,12 @@ def test_rules_content_digest_not_pathname_metadata(tmp_path):
     assert len(body_a) == len(body_b)  # same size by construction
     fixed_mtime = 1234567890123456789
     path = tmp_path / "policy.py"
-    path.write_text(body_a)
+    path.write_bytes(body_a.encode("utf-8"))
     _utime(path, fixed_mtime)
     digest_a = H._content_digest(path)
     assert digest_a is not None
     # Rewrite with different bytes, same size, same mtime_ns.
-    path.write_text(body_b)
+    path.write_bytes(body_b.encode("utf-8"))
     _utime(path, fixed_mtime)
     st_b = os.stat(path)
     digest_b = H._content_digest(path)

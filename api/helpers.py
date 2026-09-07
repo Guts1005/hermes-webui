@@ -549,18 +549,24 @@ _CacheInfo = collections.namedtuple(
 )
 
 
-# Fixed per-entry container overhead in CPython (64-bit): the (val, entry_bytes)
-# tuple (~56 bytes) plus the OrderedDict linked-list node pointers (~72 bytes).
-# Accounting for this per entry guarantees that even workloads with tens of thousands
-# of short clean strings stay strictly within max_bytes total RSS footprint.
-_ENTRY_CONTAINER_OVERHEAD_BYTES = 128
+# Exact shallow overheads in CPython (64-bit): the (val, entry_payload) 2-tuple
+# (~56 bytes) and the baseline empty OrderedDict container (~128 bytes).
+_TUPLE_OVERHEAD_BYTES = sys.getsizeof(("", 0))
+_BASE_DICT_BYTES = sys.getsizeof(collections.OrderedDict())
 
 
 class _ByteBudgetLRU:
-    """Thread-safe, byte-budgeted LRU cache for deterministic memory ceilings.
+    """Thread-safe, byte-budgeted LRU cache bounding shallow retained memory.
 
-    Worst-case retained memory equals ``max_bytes`` by construction (plus fixed
-    OrderedDict / entry overhead), regardless of the entry-size mix.
+    Worst-case retained memory is bounded by ``max_bytes``, accounting for:
+    * Key and value object allocations (``sys.getsizeof``)
+    * The stored 2-item entry tuple overhead (``_TUPLE_OVERHEAD_BYTES``)
+    * The measured ``OrderedDict`` hash-table allocation and dynamic resize slack
+
+    Memory scope:
+    Bounds cache-owned shallow retained memory (keys, values, stored tuples, and
+    OrderedDict container allocation). Does not bound process-wide RSS or allocator
+    fragmentation, as CPython's pymalloc arenas may retain unmapped heap pools.
 
     Aliasing accounting:
     * When ``key is value`` (clean-string decision memo: ``_redact_text_impl`` returns
@@ -581,12 +587,29 @@ class _ByteBudgetLRU:
         self._func = func
         self.max_bytes = max(1, int(max_bytes))
         self.name = name
-        self._data = collections.OrderedDict()  # key -> (value, entry_bytes)
-        self._retained_bytes = 0
+        self._data = collections.OrderedDict()  # key -> (value, entry_payload)
+        self._payload_bytes = 0
         self._hits = 0
         self._misses = 0
         self._lock = threading.Lock()
         functools.update_wrapper(self, func)
+
+    @property
+    def retained_bytes(self) -> int:
+        """Measured shallow bytes: keys, values, stored tuples, and OrderedDict container growth."""
+        return (
+            self._payload_bytes
+            + (len(self._data) * _TUPLE_OVERHEAD_BYTES)
+            + max(0, sys.getsizeof(self._data) - _BASE_DICT_BYTES)
+        )
+
+    def _compact_if_slack(self) -> None:
+        """Rebuild OrderedDict to release excess table allocation when capacity has high slack."""
+        if not self._data:
+            if sys.getsizeof(self._data) > _BASE_DICT_BYTES:
+                self._data = collections.OrderedDict()
+        elif (sys.getsizeof(self._data) - _BASE_DICT_BYTES) > max(256, len(self._data) * 96):
+            self._data = collections.OrderedDict(self._data)
 
     def __call__(self, key: str) -> str:
         with self._lock:
@@ -605,27 +628,37 @@ class _ByteBudgetLRU:
                 self._data.move_to_end(key)
                 return entry[0]
 
-            entry_bytes = (
+            entry_payload = (
                 sys.getsizeof(key)
                 if (key is val or id(key) == id(val))
                 else (sys.getsizeof(key) + sys.getsizeof(val))
-            ) + _ENTRY_CONTAINER_OVERHEAD_BYTES
+            )
 
-            if entry_bytes > self.max_bytes:
+            # An entry must fit within budget along with its stored tuple overhead
+            if entry_payload + _TUPLE_OVERHEAD_BYTES > self.max_bytes:
                 return val
 
-            while self._data and (self._retained_bytes + entry_bytes > self.max_bytes):
-                _, (_, evicted_bytes) = self._data.popitem(last=False)
-                self._retained_bytes -= evicted_bytes
+            self._data[key] = (val, entry_payload)
+            self._payload_bytes += entry_payload
 
-            self._data[key] = (val, entry_bytes)
-            self._retained_bytes += entry_bytes
+            evicted = False
+            while self._data and (self.retained_bytes > self.max_bytes):
+                self._compact_if_slack()
+                if self.retained_bytes <= self.max_bytes:
+                    break
+                _, (_, evicted_payload) = self._data.popitem(last=False)
+                self._payload_bytes -= evicted_payload
+                evicted = True
+
+            if evicted:
+                self._compact_if_slack()
+
             return val
 
     def cache_clear(self) -> None:
         with self._lock:
-            self._data.clear()
-            self._retained_bytes = 0
+            self._data = collections.OrderedDict()
+            self._payload_bytes = 0
             self._hits = 0
             self._misses = 0
 
@@ -636,7 +669,7 @@ class _ByteBudgetLRU:
                 misses=self._misses,
                 maxsize=None,
                 currsize=len(self._data),
-                retained_bytes=self._retained_bytes,
+                retained_bytes=self.retained_bytes,
                 max_bytes=self.max_bytes,
             )
 
