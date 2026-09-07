@@ -7551,18 +7551,10 @@ function _latestGatewayRoutingForSession(session){
   if(routing.requested_model&&session.model&&String(routing.requested_model)!==String(session.model)){
     return null;
   }
+  // ponytail: canonical route dimension matching covers explicit, legacy, and bare routes in 3 lines
   const reqProvider=String(routing.requested_provider||'').trim();
   const sessProvider=String(session.model_provider||'').trim();
-  if(routing.requested_provider&&session.model_provider&&reqProvider!==sessProvider){
-    return null;
-  }
-  if(sessProvider&&!routing.requested_provider){
-    // Legacy history lacking requested_provider cannot be assumed to belong to an explicit provider route
-    return null;
-  }
-  if(reqProvider&&!sessProvider){
-    return null;
-  }
+  if(reqProvider!==sessProvider) return null;
   return routing;
 }
 
