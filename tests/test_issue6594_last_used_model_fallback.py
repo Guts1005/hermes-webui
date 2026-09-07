@@ -426,7 +426,7 @@ async function run() {
     sidebar: _formatSessionModelWithGateway(S.session)
   });
 
-  // 6. Test legacy history from different provider rejected on explicit provider route
+  // 6. Test legacy history without requested_provider preserved when model matches
   S.session.model = 'gpt-4o';
   S.session.model_provider = 'provider-b';
   S.session.gateway_routing = null;
@@ -434,11 +434,11 @@ async function run() {
     used_model: 'gpt-4o-mini',
     provider: 'provider-a',
     requested_model: 'gpt-4o'
-    // no requested_provider, but provider attribution is provider-a
+    // no requested_provider
   }];
   syncModelChip();
   log.push({
-    phase: 'legacy_history_different_provider',
+    phase: 'legacy_history_without_requested_provider',
     chip: elements.composerModelLabel.textContent,
     sidebar: _formatSessionModelWithGateway(S.session)
   });
@@ -491,9 +491,9 @@ run();
     assert results["provider_route_turn_in_flight"]["chip"] == "Model(gpt-4o)"
     assert results["provider_route_turn_in_flight"]["sidebar"] == "Model(gpt-4o)"
 
-    # Phase 10: Legacy history with different provider is rejected when session has explicit provider
-    assert results["legacy_history_different_provider"]["chip"] == "Model(gpt-4o)"
-    assert results["legacy_history_different_provider"]["sidebar"] == "Model(gpt-4o)"
+    # Phase 10: Legacy history without requested_provider preserved when model matches
+    assert results["legacy_history_without_requested_provider"]["chip"] == "Model(gpt-4o-mini) via provider-a"
+    assert results["legacy_history_without_requested_provider"]["sidebar"] == "Model(gpt-4o-mini) via provider-a"
 
 
 def test_production_composed_provider_route_dimension_scenarios():
