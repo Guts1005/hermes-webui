@@ -426,7 +426,7 @@ async function run() {
     sidebar: _formatSessionModelWithGateway(S.session)
   });
 
-  // 6. Test legacy history without requested_provider rejected on explicit provider route
+  // 6. Test legacy history without requested_provider preserved when model matches
   S.session.model = 'gpt-4o';
   S.session.model_provider = 'provider-b';
   S.session.gateway_routing = null;
@@ -438,7 +438,7 @@ async function run() {
   }];
   syncModelChip();
   log.push({
-    phase: 'legacy_history_different_provider',
+    phase: 'legacy_history_without_requested_provider',
     chip: elements.composerModelLabel.textContent,
     sidebar: _formatSessionModelWithGateway(S.session)
   });
@@ -491,6 +491,167 @@ run();
     assert results["provider_route_turn_in_flight"]["chip"] == "Model(gpt-4o)"
     assert results["provider_route_turn_in_flight"]["sidebar"] == "Model(gpt-4o)"
 
-    # Phase 10: Legacy history without requested_provider rejected when session has explicit provider
-    assert results["legacy_history_different_provider"]["chip"] == "Model(gpt-4o)"
-    assert results["legacy_history_different_provider"]["sidebar"] == "Model(gpt-4o)"
+    # Phase 10: Legacy history without requested_provider preserved when model matches
+    assert results["legacy_history_without_requested_provider"]["chip"] == "Model(gpt-4o-mini) via provider-a"
+    assert results["legacy_history_without_requested_provider"]["sidebar"] == "Model(gpt-4o-mini) via provider-a"
+
+
+def test_production_composed_provider_route_dimension_scenarios():
+    """Composed end-to-end tests for the 5 maintainer-specified producer/consumer scenarios:
+    1. Upstream response requested_provider="CanopyWave" with session provider "canopywave" (case-insensitive match)
+    2. Named custom:<slug> after runtime rewrite to "custom" (named identity preserved end-to-end)
+    3. Exact matching providers ("openrouter" vs "openrouter")
+    4. Legacy/empty requested-provider metadata (preserves valid legacy routing history)
+    5. Same bare model on genuinely different providers ("provider-a" vs "provider-b" rejected)
+    """
+    from api.routes import _clean_session_model_provider
+    from api.streaming import _extract_gateway_routing_metadata, _normalize_gateway_routing_metadata
+
+    # Scenario 1: Upstream response requested_provider="CanopyWave" with session provider "canopywave"
+    raw_canopy = {
+        "requested_model": "deepseek-v3.2",
+        "requested_provider": "CanopyWave",
+        "used_model": "deepseek-v3.2-fast",
+        "used_provider": "CanopyWave",
+        "routing": [
+            {"provider": "CanopyWave", "status": "failed", "reason": "timeout"},
+            {"provider": "CanopyWave", "status": "success"},
+        ],
+    }
+    norm_canopy = _normalize_gateway_routing_metadata(raw_canopy)
+    assert norm_canopy["requested_provider"] == "CanopyWave"
+    sess_canopy_provider = _clean_session_model_provider("CanopyWave")
+    assert sess_canopy_provider == "canopywave"
+
+    # Scenario 2: Named custom:<slug> after runtime rewrite to "custom"
+    _session_req_prov = "custom:backup-endpoint"
+    _resolved_prov = "custom"
+    norm_custom = _extract_gateway_routing_metadata(
+        agent=None,
+        result={"used_model": "llama-local-q4", "used_provider": "custom"},
+        requested_model="llama-local",
+        requested_provider=_session_req_prov or _resolved_prov,
+    )
+    assert norm_custom["requested_provider"] == "custom:backup-endpoint"
+    sess_custom_provider = _clean_session_model_provider("custom:backup-endpoint")
+    assert sess_custom_provider == "custom:backup-endpoint"
+
+    # Scenario 3: Exact matching providers
+    raw_exact = {
+        "requested_model": "gpt-4o",
+        "requested_provider": "openrouter",
+        "used_model": "gpt-4o-mini",
+        "used_provider": "openrouter",
+    }
+    norm_exact = _normalize_gateway_routing_metadata(raw_exact)
+    sess_exact_provider = _clean_session_model_provider("openrouter")
+
+    # Scenario 4: Legacy/empty requested-provider metadata
+    raw_legacy = {
+        "requested_model": "gpt-4o",
+        "used_model": "gpt-4o-mini",
+        "used_provider": "openrouter",
+    }
+    norm_legacy = _normalize_gateway_routing_metadata(raw_legacy)
+    assert "requested_provider" not in norm_legacy
+    sess_legacy_provider = _clean_session_model_provider("openrouter")
+
+    # Scenario 5: Same bare model on genuinely different providers
+    raw_cross = {
+        "requested_model": "gpt-4o",
+        "requested_provider": "provider-a",
+        "used_model": "gpt-4o-mini",
+        "used_provider": "provider-a",
+    }
+    norm_cross = _normalize_gateway_routing_metadata(raw_cross)
+    sess_cross_provider = _clean_session_model_provider("provider-b")
+
+    script = f"""
+const scenarios = {{
+  case1_canopywave: {{
+    session: {{
+      model: 'deepseek-v3.2',
+      model_provider: {json.dumps(sess_canopy_provider)},
+      gateway_routing: {json.dumps(norm_canopy)},
+      gateway_routing_history: [{json.dumps(norm_canopy)}]
+    }},
+    modelSelectValue: 'deepseek-v3.2'
+  }},
+  case2_custom_slug: {{
+    session: {{
+      model: 'llama-local',
+      model_provider: {json.dumps(sess_custom_provider)},
+      gateway_routing: {json.dumps(norm_custom)},
+      gateway_routing_history: [{json.dumps(norm_custom)}]
+    }},
+    modelSelectValue: 'llama-local'
+  }},
+  case3_exact_match: {{
+    session: {{
+      model: 'gpt-4o',
+      model_provider: {json.dumps(sess_exact_provider)},
+      gateway_routing: {json.dumps(norm_exact)},
+      gateway_routing_history: [{json.dumps(norm_exact)}]
+    }},
+    modelSelectValue: 'gpt-4o'
+  }},
+  case4_legacy_empty: {{
+    session: {{
+      model: 'gpt-4o',
+      model_provider: {json.dumps(sess_legacy_provider)},
+      gateway_routing: {json.dumps(norm_legacy)},
+      gateway_routing_history: [{json.dumps(norm_legacy)}]
+    }},
+    modelSelectValue: 'gpt-4o'
+  }},
+  case5_different_provider_rejection: {{
+    session: {{
+      model: 'gpt-4o',
+      model_provider: {json.dumps(sess_cross_provider)},
+      gateway_routing: null,
+      gateway_routing_history: [{json.dumps(norm_cross)}]
+    }},
+    modelSelectValue: 'gpt-4o'
+  }}
+}};
+
+const out = {{}};
+for (const [k, v] of Object.entries(scenarios)) {{
+  S.session = v.session;
+  elements.modelSelect.value = v.modelSelectValue;
+  syncModelChip();
+  out[k] = {{
+    chip: elements.composerModelLabel.textContent,
+    sidebar: _formatSessionModelWithGateway(v.session),
+    routing_match: !!_latestGatewayRoutingForSession(v.session)
+  }};
+}}
+console.log(JSON.stringify(out));
+"""
+    results = json.loads(_production_event_harness(script))
+
+    # Verification 1: Case-insensitive match (CanopyWave vs canopywave)
+    assert results["case1_canopywave"]["routing_match"] is True
+    assert "deepseek-v3.2-fast" in results["case1_canopywave"]["chip"]
+    assert "deepseek-v3.2-fast" in results["case1_canopywave"]["sidebar"]
+
+    # Verification 2: Named custom:<slug> preserved and matches
+    assert results["case2_custom_slug"]["routing_match"] is True
+    assert "llama-local-q4" in results["case2_custom_slug"]["chip"]
+    assert "llama-local-q4" in results["case2_custom_slug"]["sidebar"]
+
+    # Verification 3: Exact matching providers
+    assert results["case3_exact_match"]["routing_match"] is True
+    assert "gpt-4o-mini" in results["case3_exact_match"]["chip"]
+    assert "gpt-4o-mini" in results["case3_exact_match"]["sidebar"]
+
+    # Verification 4: Legacy/empty requested_provider metadata is preserved
+    assert results["case4_legacy_empty"]["routing_match"] is True
+    assert "gpt-4o-mini" in results["case4_legacy_empty"]["chip"]
+    assert "gpt-4o-mini" in results["case4_legacy_empty"]["sidebar"]
+
+    # Verification 5: Same bare model on genuinely different providers is REJECTED
+    assert results["case5_different_provider_rejection"]["routing_match"] is False
+    assert results["case5_different_provider_rejection"]["chip"] == "Model(gpt-4o)"
+    assert results["case5_different_provider_rejection"]["sidebar"] == "Model(gpt-4o)"
+
