@@ -3,12 +3,15 @@ Hermes Web UI -- HTTP helper functions.
 """
 import base64 as _base64
 import binascii as _binascii
+import collections
 import functools
 import json as _json
 import logging
 import os
 import re as _re
 import ssl
+import sys
+import threading
 from pathlib import Path
 from api.config import IMAGE_EXTS, MD_EXTS
 
@@ -501,36 +504,148 @@ except Exception:
 _REDACT_CACHE_MAX_TEXT_LEN = 16384
 _REDACT_TEXT_BIG_CACHE_MAX = 262144
 
-# Per-tier entry ceilings so a raised env knob can't exceed a bounded byte
-# footprint. A SHARED count cap would let the 256KiB big tier retain ~32GiB at a
-# 131072-entry ceiling while the 16KiB small tiers hold a fraction of that
-# (greptile P1). Each cap is derived from a 1GiB-per-tier byte budget (keys+
-# values), so small tiers (16KiB) cap at 32768 and the big tier (256KiB) at
-# 2048. Defaults (16384/16384/256) sit below these; env knobs stay tunable but
-# never balloon.
-_REDACT_MEMO_BYTE_BUDGET = 1024 * 1024 * 1024  # 1 GiB per tier (keys+values)
+# Byte-budgeted eviction for the decision/redactor memo LRUs (#7439):
+# The process-wide memos are bounded by a byte budget per tier rather than count
+# caps, guaranteeing worst-case retained memory equals the configured budget by
+# construction (independent of entry-size distribution).
+_REDACT_MEMO_BYTE_BUDGET = 1024 * 1024 * 1024  # 1 GiB per tier hard ceiling
 _REDACT_SMALL_TIER_CAP = _REDACT_MEMO_BYTE_BUDGET // (2 * _REDACT_CACHE_MAX_TEXT_LEN)
 _REDACT_BIG_TIER_CAP = _REDACT_MEMO_BYTE_BUDGET // (2 * _REDACT_TEXT_BIG_CACHE_MAX)
 
+_REDACT_FN_MEMO_BYTE_BUDGET_DEFAULT = 512 * 1024 * 1024        # 512 MiB
+_REDACT_DECISION_MEMO_BYTE_BUDGET_DEFAULT = 512 * 1024 * 1024   # 512 MiB
+_REDACT_BIG_DECISION_MEMO_BYTE_BUDGET_DEFAULT = 128 * 1024 * 1024   # 128 MiB
 
-def _lru_size(default: int, env: str, cap: int) -> int:
-    """Return a positive LRU ``maxsize``, overridable via env var ``env`` and
-    clamped to ``cap`` (the tier's byte-budget-derived ceiling).
 
-    The redaction/decision memos are process-wide and retained across sessions
-    (deliberate: the perf win is that repeat loads skip re-scanning and
-    re-redacting). Each is bounded by its LRU ``maxsize``; the shipped defaults
-    are conservative, and the caps are exposed as env knobs
-    (``HERMES_WEBUI_REDACT_*``) so a host can tune them. ``cap`` keeps an errant
-    entry from ballooning past the tier's RSS budget.
+def _byte_budget(
+    default: int,
+    env: str,
+    cap: int = _REDACT_MEMO_BYTE_BUDGET,
+    alt_env: str = "",
+) -> int:
+    """Return a positive byte budget, overridable via env var ``env`` (or ``alt_env``)
+    and clamped to ``cap`` (the tier's hard ceiling).
     """
-    try:
-        val = int(os.getenv(env, default))
-        if val >= 1:
-            return min(val, cap)
-    except (TypeError, ValueError):
-        pass
+    for var in (env, alt_env):
+        if not var:
+            continue
+        val_str = os.getenv(var)
+        if val_str is not None:
+            try:
+                val = int(val_str)
+                if val >= 1:
+                    return min(val, cap)
+            except (TypeError, ValueError):
+                pass
     return default
+
+
+_lru_size = _byte_budget
+
+
+_CacheInfo = collections.namedtuple(
+    "_CacheInfo",
+    ["hits", "misses", "maxsize", "currsize", "retained_bytes", "max_bytes"],
+)
+
+
+class _ByteBudgetLRU:
+    """Thread-safe, byte-budgeted LRU cache for deterministic memory ceilings.
+
+    Worst-case retained memory equals ``max_bytes`` by construction (plus fixed
+    OrderedDict / entry overhead), regardless of the entry-size mix.
+
+    Aliasing accounting:
+    * When ``key is value`` (clean-string decision memo: ``_redact_text_impl`` returns
+      the input string unchanged on a prefilter miss), the entry only consumes
+      ``sys.getsizeof(key)`` bytes once. Double-counting clean strings would over-account
+      by ~2x on the dominant transcript path and cause premature eviction.
+    * When ``key is not value``, the entry consumes ``sys.getsizeof(key) + sys.getsizeof(value)``.
+    * Cross-tier sharing (e.g. between ``_redact_fn_lru`` and ``_redact_text_lru``) is
+      safely over-counted per-tier by design (evicts earlier; never exceeds budget).
+
+    Thread-safety:
+    All mutations, recency bumps on read, evictions, clears, and cache_info reads
+    are protected by an internal ``threading.Lock``. Pure function execution occurs
+    outside the lock to prevent lock contention across regex execution.
+    """
+
+    def __init__(self, func, max_bytes: int, name: str = ""):
+        self._func = func
+        self.max_bytes = max(1, int(max_bytes))
+        self.name = name
+        self._data = collections.OrderedDict()  # key -> (value, entry_bytes)
+        self._retained_bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._lock = threading.Lock()
+        functools.update_wrapper(self, func)
+
+    def __call__(self, key: str) -> str:
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is not None:
+                self._data.move_to_end(key)
+                self._hits += 1
+                return entry[0]
+            self._misses += 1
+
+        val = self._func(key)
+
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is not None:
+                self._data.move_to_end(key)
+                return entry[0]
+
+            entry_bytes = (
+                sys.getsizeof(key)
+                if (key is val or id(key) == id(val))
+                else (sys.getsizeof(key) + sys.getsizeof(val))
+            )
+
+            if entry_bytes > self.max_bytes:
+                return val
+
+            while self._data and (self._retained_bytes + entry_bytes > self.max_bytes):
+                _, (_, evicted_bytes) = self._data.popitem(last=False)
+                self._retained_bytes -= evicted_bytes
+
+            self._data[key] = (val, entry_bytes)
+            self._retained_bytes += entry_bytes
+            return val
+
+    def cache_clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self._retained_bytes = 0
+            self._hits = 0
+            self._misses = 0
+
+    def cache_info(self) -> _CacheInfo:
+        with self._lock:
+            return _CacheInfo(
+                hits=self._hits,
+                misses=self._misses,
+                maxsize=None,
+                currsize=len(self._data),
+                retained_bytes=self._retained_bytes,
+                max_bytes=self.max_bytes,
+            )
+
+    def cache_parameters(self) -> dict:
+        with self._lock:
+            return {
+                "max_bytes": self.max_bytes,
+                "typed": False,
+            }
+
+
+def byte_budget_lru_cache(max_bytes: int, name: str = ""):
+    """Decorator returning a thread-safe, byte-budgeted LRU cache."""
+    def decorator(fn):
+        return _ByteBudgetLRU(fn, max_bytes=max_bytes, name=name)
+    return decorator
 
 
 # Repeated dashboard polls re-request the same unchanged session payloads, so
@@ -539,8 +654,14 @@ def _lru_size(default: int, env: str, cap: int) -> int:
 # the GIL and surface as "Mất kết nối" in the browser. The redactor is pure and
 # deterministic (force=True, fixed masking), so identical strings always map to
 # identical output and are safe to memoize without invalidation.
-_redact_fn_lru = functools.lru_cache(
-    maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_FN_MEMO", _REDACT_SMALL_TIER_CAP)
+_redact_fn_lru = byte_budget_lru_cache(
+    max_bytes=_byte_budget(
+        _REDACT_FN_MEMO_BYTE_BUDGET_DEFAULT,
+        "HERMES_WEBUI_REDACT_FN_BYTE_BUDGET",
+        _REDACT_MEMO_BYTE_BUDGET,
+        alt_env="HERMES_WEBUI_REDACT_FN_MEMO_BYTE_BUDGET",
+    ),
+    name="redact_fn",
 )(_redact_fn_uncached)
 
 def _redact_fn_cached(text):
@@ -557,24 +678,34 @@ def _redact_fn_cached(text):
 # DECISION is memoized here: warm passes become dict lookups, and CPython
 # caches str hashes on the string objects themselves, so sessions held in the
 # compact-session LRU skip even the hash cost. Two tiers mirror the redactor
-# memo: small (≤16KiB, 16384 entries) and big (≤256KiB, 256 entries).
-# Worst-case tier RSS (keys+values at the caps): big tier 256·256KiB ≈ 128MB,
-# small decision tier 16384·16KiB ≈ 512MB, redactor memo 16384·16KiB ≈ 512MB — a
-# ~1.1GB theoretical ceiling. Realistic occupancy is far lower (clean strings
-# alias their key objects, most transcript strings are short), and strings above
-# the caps bypass the cache entirely. All three capacities are tunable via
-# HERMES_WEBUI_REDACT_* env vars, each clamped to a per-tier byte-budget cap.
+# memo: small (≤16KiB, 512MiB budget) and big (≤256KiB, 128MiB budget).
+# Worst-case tier RSS equals the configured byte budget by construction,
+# with single-accounting for aliased clean strings and wholesale eviction on
+# session deletion. All three budgets are tunable via HERMES_WEBUI_REDACT_*_BYTE_BUDGET
+# env vars, each clamped to the 1GiB hard ceiling.
 def _redact_text_impl(text: str) -> str:
     if not _might_contain_sensitive_text(text):
         return text
     return _redact_fn_cached(text)
 
 
-_redact_text_lru = functools.lru_cache(
-    maxsize=_lru_size(16384, "HERMES_WEBUI_REDACT_DECISION_MEMO", _REDACT_SMALL_TIER_CAP)
+_redact_text_lru = byte_budget_lru_cache(
+    max_bytes=_byte_budget(
+        _REDACT_DECISION_MEMO_BYTE_BUDGET_DEFAULT,
+        "HERMES_WEBUI_REDACT_DECISION_BYTE_BUDGET",
+        _REDACT_MEMO_BYTE_BUDGET,
+        alt_env="HERMES_WEBUI_REDACT_DECISION_MEMO_BYTE_BUDGET",
+    ),
+    name="redact_text_small",
 )(_redact_text_impl)
-_redact_text_big_lru = functools.lru_cache(
-    maxsize=_lru_size(256, "HERMES_WEBUI_REDACT_BIG_DECISION_MEMO", _REDACT_BIG_TIER_CAP)
+_redact_text_big_lru = byte_budget_lru_cache(
+    max_bytes=_byte_budget(
+        _REDACT_BIG_DECISION_MEMO_BYTE_BUDGET_DEFAULT,
+        "HERMES_WEBUI_REDACT_BIG_DECISION_BYTE_BUDGET",
+        _REDACT_MEMO_BYTE_BUDGET,
+        alt_env="HERMES_WEBUI_REDACT_BIG_DECISION_MEMO_BYTE_BUDGET",
+    ),
+    name="redact_text_big",
 )(_redact_text_impl)
 
 

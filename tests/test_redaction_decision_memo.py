@@ -1,16 +1,23 @@
 """Regression: `_redact_text` decision memo must be byte-identical to the
-uncached path, bounded, and safe on toggle.
+uncached path, byte-budgeted, and safe on toggle.
 
-Companion to the #5204 redactor memo contract: the perf(conversation-switch)
-change routes `_redact_text` through a per-string memo of the entire
-clean-or-redacted decision (prefilter + redactor) in two size tiers. Locks:
+Companion to the #5204 redactor memo contract and #7439 byte-budgeted eviction:
+the perf(conversation-switch) change routes `_redact_text` through a per-string
+memo of the entire clean-or-redacted decision (prefilter + redactor) in two size tiers.
+Worst-case retained memory equals the configured byte budget by construction.
+Locks:
   * memoized results are byte-identical to `_redact_text_impl` (no behavior
     change from caching),
   * repeat calls hit the memo (that is the point),
   * strings above the big-tier ceiling stay uncached yet still redact,
   * enabled=False bypasses the memo entirely (cache only ever holds
-    enabled=True results, so no staleness on toggle).
+    enabled=True results, so no staleness on toggle),
+  * byte budget is strictly enforced (retained_bytes <= max_bytes at all times),
+  * aliased clean strings (key is value) are accounted once,
+  * thread-safe under concurrent access.
 """
+import sys
+import threading
 from api import helpers as H
 
 _SECRET = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -61,31 +68,102 @@ def test_redact_text_giant_above_ceiling_not_memoized():
     assert H._redact_text_big_lru.cache_info().misses == before  # tier skipped
 
 
-def test_redact_memo_caps_defaulted_and_env_tunable(monkeypatch):
-    # The process-wide memos are bounded by LRU maxsize PER TIER (memory cannot
-    # grow unboundedly), and the shipped defaults are conservative (greptile P1).
-    # Env vars can raise/lower them, but each tier is clamped to its byte budget.
-    assert H._redact_fn_lru.cache_info().maxsize == 16384
-    assert H._redact_text_lru.cache_info().maxsize == 16384
-    assert H._redact_text_big_lru.cache_info().maxsize == 256
+def test_redact_memo_budgets_defaulted_and_env_tunable(monkeypatch):
+    # Process-wide memos are bounded by byte budgets per tier (#7439)
+    assert H._redact_fn_lru.cache_info().max_bytes == 512 * 1024 * 1024
+    assert H._redact_text_lru.cache_info().max_bytes == 512 * 1024 * 1024
+    assert H._redact_text_big_lru.cache_info().max_bytes == 128 * 1024 * 1024
 
-    # _lru_size: positive int from env, clamped to `cap`, else the default.
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 100
-    monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "5")
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 5
-    monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "0")
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 100  # <1 rejected
-    monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "not-a-number")
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 100  # invalid rejected
-    # A fat-fingered huge value is clamped to the per-tier cap (greptile P1: the
-    # big tier must not allow 131072 * 256KiB ≈ 32GiB).
-    monkeypatch.setenv("PI_TEST_REDACT_MEMO_MISSING", "999999999")
-    assert H._lru_size(100, "PI_TEST_REDACT_MEMO_MISSING", 200) == 200
-    # Big-tier ceiling is byte-budget derived from the REAL per-entry caps and
-    # far below a shared-count cap (greptile P1). This is not tautological: the
-    # caps are derived from _REDACT_CACHE_MAX_TEXT_LEN / _REDACT_TEXT_BIG_CACHE_MAX
-    # (the values the caches actually enforce), so if those drift the assertion fails.
-    assert H._REDACT_BIG_TIER_CAP < 131072
-    assert H._redact_text_big_lru.cache_info().maxsize <= H._REDACT_BIG_TIER_CAP
+    # _byte_budget: positive int from env, clamped to `cap`, else default
+    assert H._byte_budget(100, "PI_TEST_REDACT_BUDGET_MISSING", 200) == 100
+    monkeypatch.setenv("PI_TEST_REDACT_BUDGET_MISSING", "5")
+    assert H._byte_budget(100, "PI_TEST_REDACT_BUDGET_MISSING", 200) == 5
+    monkeypatch.setenv("PI_TEST_REDACT_BUDGET_MISSING", "0")
+    assert H._byte_budget(100, "PI_TEST_REDACT_BUDGET_MISSING", 200) == 100  # <1 rejected
+    monkeypatch.setenv("PI_TEST_REDACT_BUDGET_MISSING", "not-a-number")
+    assert H._byte_budget(100, "PI_TEST_REDACT_BUDGET_MISSING", 200) == 100  # invalid rejected
+    monkeypatch.setenv("PI_TEST_REDACT_BUDGET_MISSING", "999999999999")
+    assert H._byte_budget(100, "PI_TEST_REDACT_BUDGET_MISSING", 200) == 200  # clamped to cap
+
+    # Cap invariants preserved
+    assert H._REDACT_MEMO_BYTE_BUDGET == 1024 * 1024 * 1024
     assert H._REDACT_SMALL_TIER_CAP == H._REDACT_MEMO_BYTE_BUDGET // (2 * H._REDACT_CACHE_MAX_TEXT_LEN)
     assert H._REDACT_BIG_TIER_CAP == H._REDACT_MEMO_BYTE_BUDGET // (2 * H._REDACT_TEXT_BIG_CACHE_MAX)
+
+
+def test_byte_budget_lru_eviction_and_accounting():
+    # Construct a small ByteBudgetLRU to verify exact byte accounting & eviction
+    cache = H.byte_budget_lru_cache(max_bytes=1000, name="test_lru")(lambda s: s)
+
+    # Clean string: key is val -> single accounting
+    s1 = "hello_world_1"
+    cache(s1)
+    expected_bytes_s1 = sys.getsizeof(s1)
+    info1 = cache.cache_info()
+    assert info1.retained_bytes == expected_bytes_s1
+    assert info1.currsize == 1
+
+    # Redacted string: key is not val -> dual accounting
+    cache_redact = H.byte_budget_lru_cache(max_bytes=1000, name="test_redact")(lambda s: s.replace("secret", "xxx"))
+    s2 = "this_has_a_secret_here"
+    val2 = cache_redact(s2)
+    expected_bytes_s2 = sys.getsizeof(s2) + sys.getsizeof(val2)
+    info2 = cache_redact.cache_info()
+    assert info2.retained_bytes == expected_bytes_s2
+    assert info2.currsize == 1
+
+    # Exceeding budget evicts oldest entries (LRU order)
+    tight_cache = H.byte_budget_lru_cache(max_bytes=350, name="tight")(lambda s: s)
+    e1 = "a" * 100
+    e2 = "b" * 100
+    e3 = "c" * 100
+    size_e1 = sys.getsizeof(e1)
+    size_e2 = sys.getsizeof(e2)
+    size_e3 = sys.getsizeof(e3)
+
+    tight_cache(e1)
+    tight_cache(e2)
+    assert tight_cache.cache_info().currsize == 2
+    assert tight_cache.cache_info().retained_bytes == size_e1 + size_e2
+
+    # Access e1 again to make e2 the LRU
+    tight_cache(e1)
+
+    # Insert e3 -> should evict e2, retaining e1 and e3
+    tight_cache(e3)
+    info_tight = tight_cache.cache_info()
+    assert info_tight.currsize == 2
+    assert info_tight.retained_bytes == size_e1 + size_e3
+    assert info_tight.retained_bytes <= 350
+
+    # Cache clear resets retained_bytes and currsize
+    tight_cache.cache_clear()
+    cleared_info = tight_cache.cache_info()
+    assert cleared_info.currsize == 0
+    assert cleared_info.retained_bytes == 0
+    assert cleared_info.hits == 0
+    assert cleared_info.misses == 0
+
+
+def test_byte_budget_lru_thread_safety():
+    cache = H.byte_budget_lru_cache(max_bytes=5000, name="concurrent")(lambda s: s + "_out")
+    errors = []
+
+    def worker(worker_id):
+        try:
+            for i in range(50):
+                k = f"key_{worker_id}_{i % 10}"
+                cache(k)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    info = cache.cache_info()
+    assert info.retained_bytes <= 5000
+    assert info.currsize > 0
