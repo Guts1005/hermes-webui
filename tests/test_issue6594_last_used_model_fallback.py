@@ -79,10 +79,12 @@ function getModelLabel(id) { return id ? ('Model(' + id + ')') : ''; }
 def _production_event_harness(eval_code: str) -> str:
     ui_source = UI_JS.read_text(encoding="utf-8")
     boot_source = BOOT_JS.read_text(encoding="utf-8")
+    sessions_source = SESSIONS_JS.read_text(encoding="utf-8")
 
     fn_gateway_routing_label = _extract_function(ui_source, "_gatewayRoutingLabel")
     fn_format_gateway_model_label = _extract_function(ui_source, "_formatGatewayModelLabel")
     fn_latest_gateway_routing = _extract_function(ui_source, "_latestGatewayRoutingForSession")
+    fn_format_session_model_with_gateway = _extract_function(sessions_source, "_formatSessionModelWithGateway")
     fn_sync_model_chip = _extract_function(ui_source, "syncModelChip")
     fn_select_model = _extract_function(ui_source, "selectModelFromDropdown")
     fn_apply_ctx = _extract_function(boot_source, "_applySessionContextMetadataUpdate")
@@ -137,7 +139,7 @@ async function api(endpoint, opts) {{
         model_provider: body.model_provider,
         last_used_model: null,
         gateway_routing: null,
-        gateway_routing_history: []
+        gateway_routing_history: (S.session && S.session.gateway_routing_history) || []
       }}
     }};
   }}
@@ -147,6 +149,7 @@ async function api(endpoint, opts) {{
 {fn_gateway_routing_label}
 {fn_format_gateway_model_label}
 {fn_latest_gateway_routing}
+{fn_format_session_model_with_gateway}
 {fn_sync_model_chip}
 {fn_select_model}
 {fn_apply_ctx}
@@ -261,44 +264,58 @@ console.log(_formatSessionModelWithGateway(s));
 
 
 def test_server_session_update_clears_stale_fallback_and_routing():
-    """Server /api/session/update clears last_used_model, gateway_routing, and history when route changes."""
+    """Server /api/session/update invalidates display fields while preserving gateway_routing_history."""
+    from unittest.mock import MagicMock, patch
+    from urllib.parse import urlparse
+    from api import routes
+
     session = Session(
         session_id="server_update_clear_test",
         title="Server Invalidation",
         model="claude-3-5-sonnet",
         model_provider="anthropic",
         last_used_model="claude-3-haiku",
-        gateway_routing={"used_model": "claude-3-haiku", "provider": "anthropic"},
-        gateway_routing_history=[{"used_model": "claude-3-haiku", "provider": "anthropic"}],
+        gateway_routing={"used_model": "claude-3-haiku", "provider": "anthropic", "requested_model": "claude-3-5-sonnet"},
+        gateway_routing_history=[{"used_model": "claude-3-haiku", "provider": "anthropic", "requested_model": "claude-3-5-sonnet"}],
     )
-    session.save()
+    session.save = MagicMock()
 
-    # Emulate the server /api/session/update logic in api/routes.py:15840-15850
-    old_model = getattr(session, "model", None)
-    old_provider = getattr(session, "model_provider", None)
+    captured = {}
+    def fake_j(h, payload, status=200):
+        captured["payload"] = payload
+        return True
 
-    session.model = "gpt-4o"
-    session.model_provider = "openai"
-    if (
-        str(old_model or "") != str(getattr(session, "model", "") or "")
-        or str(old_provider or "") != str(getattr(session, "model_provider", "") or "")
-    ):
-        session.last_used_model = None
-        session.gateway_routing = None
-        session.gateway_routing_history = []
-    session.save()
+    handler = MagicMock()
+    body = {
+        "session_id": "server_update_clear_test",
+        "model": "gpt-4o",
+        "model_provider": "openai",
+        "workspace": "/tmp",
+    }
+    with patch("api.routes._check_csrf", return_value=True), \
+         patch("api.routes.read_body", return_value=body), \
+         patch("api.routes.get_session", return_value=session), \
+         patch("api.routes.resolve_trusted_workspace", return_value="/tmp"), \
+         patch("api.routes.j", side_effect=fake_j):
+        handled = routes.handle_post(handler, urlparse("/api/session/update"))
 
-    reloaded = Session.load("server_update_clear_test")
-    assert reloaded.model == "gpt-4o"
-    assert reloaded.model_provider == "openai"
-    assert reloaded.last_used_model is None
-    assert reloaded.gateway_routing is None
-    assert reloaded.gateway_routing_history == []
+    assert handled is True
+    # Assert session model and provider updated
+    assert session.model == "gpt-4o"
+    assert session.model_provider == "openai"
+    # Assert display fallback and current routing invalidated
+    assert session.last_used_model is None
+    assert session.gateway_routing is None
+    # Assert bounded history is preserved on the session
+    assert session.gateway_routing_history == [{"used_model": "claude-3-haiku", "provider": "anthropic", "requested_model": "claude-3-5-sonnet"}]
+    session.save.assert_called_once()
 
-    compact = reloaded.compact()
-    assert compact["model"] == "gpt-4o"
-    assert compact["last_used_model"] is None
-    assert compact["gateway_routing"] is None
+    # Assert returned API response projection
+    resp_session = captured["payload"]["session"]
+    assert resp_session["model"] == "gpt-4o"
+    assert resp_session.get("last_used_model") is None
+    assert resp_session.get("gateway_routing") is None
+    assert resp_session.get("gateway_routing_history") == [{"used_model": "claude-3-haiku", "provider": "anthropic", "requested_model": "claude-3-5-sonnet"}]
 
 
 def test_production_model_selection_lifecycle_observable_behavior():
@@ -317,7 +334,7 @@ async function run() {
   //   - syncModelChip() (first call: manual pick active)
   //   - modelSelect.onchange() (routeChanged invalidates last_used_model, S.session.model = 'gpt-4o')
   //   - syncModelChip() (second call: sel.value === S.session.model, last_used_model is cleared)
-  //   - api('/api/session/update') returns cleared session metadata
+  //   - api('/api/session/update') returns session projection with preserved history
   //   - _applySessionContextMetadataUpdate(data)
   //   - syncModelChip() (third call after server update)
   await selectModelFromDropdown('gpt-4o');
@@ -333,36 +350,55 @@ async function run() {
   S.session.gateway_routing_history = [{ used_model: 'llama-3', provider: 'openrouter', requested_model: 'gpt-4o' }];
   elements.modelSelect.value = 'gpt-4o';
   syncModelChip();
-  log.push({ phase: 'gateway_initial', label: elements.composerModelLabel.textContent });
+  log.push({
+    phase: 'gateway_initial',
+    chip: elements.composerModelLabel.textContent,
+    sidebar: _formatSessionModelWithGateway(S.session)
+  });
 
   // User selects 'claude-3-5-sonnet' from dropdown
   await selectModelFromDropdown('claude-3-5-sonnet');
-  log.push({ phase: 'gateway_after_switch', label: elements.composerModelLabel.textContent });
+  log.push({
+    phase: 'gateway_after_switch',
+    chip: elements.composerModelLabel.textContent,
+    sidebar: _formatSessionModelWithGateway(S.session),
+    history_len: S.session.gateway_routing_history.length
+  });
 
   // While next turn is in flight
   syncModelChip();
-  log.push({ phase: 'gateway_turn_in_flight', label: elements.composerModelLabel.textContent });
+  log.push({
+    phase: 'gateway_turn_in_flight',
+    chip: elements.composerModelLabel.textContent,
+    sidebar: _formatSessionModelWithGateway(S.session)
+  });
 
   console.log(JSON.stringify(log));
 }
 run();
 """)
-    results = {item["phase"]: item["label"] for item in json.loads(raw_output)}
+    results = {item["phase"]: item for item in json.loads(raw_output)}
 
     # Phase 1: Initial served direct fallback model displayed
-    assert results["initial"] == "Model(claude-3-haiku)"
+    assert results["initial"]["label"] == "Model(claude-3-haiku)"
 
     # Phase 2: After selectModelFromDropdown + onchange + session update, chip remains the newly selected model
-    assert results["after_select_and_update"] == "Model(gpt-4o)"
+    assert results["after_select_and_update"]["label"] == "Model(gpt-4o)"
 
     # Phase 3: In-flight turn does not snap back to stale last_used_model
-    assert results["turn_in_flight"] == "Model(gpt-4o)"
+    assert results["turn_in_flight"]["label"] == "Model(gpt-4o)"
 
-    # Phase 4: Gateway routing session initially displays gateway routed label
-    assert results["gateway_initial"] == "Model(llama-3) via openrouter"
+    # Phase 4: Gateway routing session initially displays gateway routed label on chip and sidebar
+    assert results["gateway_initial"]["chip"] == "Model(llama-3) via openrouter"
+    assert results["gateway_initial"]["sidebar"] == "Model(llama-3) via openrouter"
 
-    # Phase 5: After switching to claude-3-5-sonnet, chip displays the new model, ignoring stale gateway routing
-    assert results["gateway_after_switch"] == "Model(claude-3-5-sonnet)"
+    # Phase 5: After switching to claude-3-5-sonnet:
+    # - Chip and sidebar display the new model
+    # - Routing history from prior route is preserved (length 1), but cannot drive display
+    assert results["gateway_after_switch"]["chip"] == "Model(claude-3-5-sonnet)"
+    assert results["gateway_after_switch"]["sidebar"] == "Model(claude-3-5-sonnet)"
+    assert results["gateway_after_switch"]["history_len"] == 1
 
-    # Phase 6: In-flight turn retains the new model
-    assert results["gateway_turn_in_flight"] == "Model(claude-3-5-sonnet)"
+    # Phase 6: In-flight turn retains the new model on both surfaces
+    assert results["gateway_turn_in_flight"]["chip"] == "Model(claude-3-5-sonnet)"
+    assert results["gateway_turn_in_flight"]["sidebar"] == "Model(claude-3-5-sonnet)"

@@ -4897,7 +4897,6 @@ async function selectModelFromDropdown(value){
     if(sessionModelChanged){
       S.session.last_used_model = null;
       S.session.gateway_routing = null;
-      S.session.gateway_routing_history = [];
     }
   }
   // Resolve the provider-specific option so duplicate bare IDs (e.g. gpt-5.5

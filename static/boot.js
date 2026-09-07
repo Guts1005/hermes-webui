@@ -2287,7 +2287,6 @@ $('modelSelect').onchange=async()=>{
   if(routeChanged){
     S.session.last_used_model = null;
     S.session.gateway_routing = null;
-    S.session.gateway_routing_history = [];
   }
   S.session.model=modelState.model;
   S.session.model_provider=modelState.model_provider||null;
