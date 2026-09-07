@@ -7551,8 +7551,8 @@ function _latestGatewayRoutingForSession(session){
   if(routing.requested_model&&session.model&&String(routing.requested_model)!==String(session.model)){
     return null;
   }
-  // Canonical provider identity matching: case-insensitive, preserves legacy/empty
-  const reqProvider=String(routing.requested_provider||'').trim().toLowerCase();
+  // Canonical provider identity matching: case-insensitive, falls back to legacy provider attribution
+  const reqProvider=String(routing.requested_provider||routing.provider||routing.used_provider||'').trim().toLowerCase();
   const sessProvider=String(session.model_provider||'').trim().toLowerCase();
   if(reqProvider && sessProvider && reqProvider !== sessProvider) return null;
   return routing;
