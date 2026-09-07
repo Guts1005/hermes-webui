@@ -95,36 +95,40 @@ def test_byte_budget_lru_eviction_and_accounting():
     # Construct a small ByteBudgetLRU to verify exact byte accounting & eviction
     cache = H.byte_budget_lru_cache(max_bytes=1000, name="test_lru")(lambda s: s)
 
-    # Clean string: key is val -> single accounting
+    overhead = H._ENTRY_CONTAINER_OVERHEAD_BYTES
+
+    # Clean string: key is val -> single accounting plus container overhead
     s1 = "hello_world_1"
     cache(s1)
-    expected_bytes_s1 = sys.getsizeof(s1)
+    expected_bytes_s1 = sys.getsizeof(s1) + overhead
     info1 = cache.cache_info()
     assert info1.retained_bytes == expected_bytes_s1
     assert info1.currsize == 1
 
-    # Redacted string: key is not val -> dual accounting
+    # Redacted string: key is not val -> dual accounting plus container overhead
     cache_redact = H.byte_budget_lru_cache(max_bytes=1000, name="test_redact")(lambda s: s.replace("secret", "xxx"))
     s2 = "this_has_a_secret_here"
     val2 = cache_redact(s2)
-    expected_bytes_s2 = sys.getsizeof(s2) + sys.getsizeof(val2)
+    expected_bytes_s2 = sys.getsizeof(s2) + sys.getsizeof(val2) + overhead
     info2 = cache_redact.cache_info()
     assert info2.retained_bytes == expected_bytes_s2
     assert info2.currsize == 1
 
     # Exceeding budget evicts oldest entries (LRU order)
-    tight_cache = H.byte_budget_lru_cache(max_bytes=350, name="tight")(lambda s: s)
+    # Each 100-char string is ~150B + 128B overhead = ~278B.
+    # Budget of 600B holds exactly 2 entries (~556B) and evicts on the 3rd.
+    tight_cache = H.byte_budget_lru_cache(max_bytes=600, name="tight")(lambda s: s)
     e1 = "a" * 100
     e2 = "b" * 100
     e3 = "c" * 100
-    size_e1 = sys.getsizeof(e1)
-    size_e2 = sys.getsizeof(e2)
-    size_e3 = sys.getsizeof(e3)
+    cost_e1 = sys.getsizeof(e1) + overhead
+    cost_e2 = sys.getsizeof(e2) + overhead
+    cost_e3 = sys.getsizeof(e3) + overhead
 
     tight_cache(e1)
     tight_cache(e2)
     assert tight_cache.cache_info().currsize == 2
-    assert tight_cache.cache_info().retained_bytes == size_e1 + size_e2
+    assert tight_cache.cache_info().retained_bytes == cost_e1 + cost_e2
 
     # Access e1 again to make e2 the LRU
     tight_cache(e1)
@@ -133,8 +137,8 @@ def test_byte_budget_lru_eviction_and_accounting():
     tight_cache(e3)
     info_tight = tight_cache.cache_info()
     assert info_tight.currsize == 2
-    assert info_tight.retained_bytes == size_e1 + size_e3
-    assert info_tight.retained_bytes <= 350
+    assert info_tight.retained_bytes == cost_e1 + cost_e3
+    assert info_tight.retained_bytes <= 600
 
     # Cache clear resets retained_bytes and currsize
     tight_cache.cache_clear()

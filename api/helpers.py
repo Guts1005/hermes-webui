@@ -549,6 +549,13 @@ _CacheInfo = collections.namedtuple(
 )
 
 
+# Fixed per-entry container overhead in CPython (64-bit): the (val, entry_bytes)
+# tuple (~56 bytes) plus the OrderedDict linked-list node pointers (~72 bytes).
+# Accounting for this per entry guarantees that even workloads with tens of thousands
+# of short clean strings stay strictly within max_bytes total RSS footprint.
+_ENTRY_CONTAINER_OVERHEAD_BYTES = 128
+
+
 class _ByteBudgetLRU:
     """Thread-safe, byte-budgeted LRU cache for deterministic memory ceilings.
 
@@ -602,7 +609,7 @@ class _ByteBudgetLRU:
                 sys.getsizeof(key)
                 if (key is val or id(key) == id(val))
                 else (sys.getsizeof(key) + sys.getsizeof(val))
-            )
+            ) + _ENTRY_CONTAINER_OVERHEAD_BYTES
 
             if entry_bytes > self.max_bytes:
                 return val
