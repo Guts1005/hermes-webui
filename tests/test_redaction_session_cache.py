@@ -279,24 +279,126 @@ def test_monotonic_generation_prevents_aba_republication(state_dir):
 
     sid = "sessMonotonicABA"
     path = _redact_session_cache_path(sid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}", encoding="utf-8")
 
     # Initial token is default 0
     token_0 = _REDACTION_SESSION_GEN.get(sid, 0)
     assert token_0 == 0
 
     # Delete session increments generation
-    delete_redaction_session_cache(sid)
+    assert delete_redaction_session_cache(sid) is True
     token_1 = _REDACTION_SESSION_GEN.get(sid, 0)
     assert token_1 == 1
 
     # Simulate repeated deletions/churn; generation must be strictly monotonic
     for i in range(2, 20):
-        delete_redaction_session_cache(sid)
+        path.write_text("{}", encoding="utf-8")
+        assert delete_redaction_session_cache(sid) is True
         assert _REDACTION_SESSION_GEN.get(sid, 0) == i
 
     # Old tokens (like token_0) can never match live generation
     assert _REDACTION_SESSION_GEN.get(sid, 0) > token_0
     assert not path.exists()
+
+
+def test_distinct_session_deletes_leave_generation_bookkeeping_bounded(state_dir, monkeypatch):
+    from api.helpers import _REDACTION_SESSION_GEN, _MAX_REDACTION_GEN_CAP, delete_redaction_session_cache, _redact_session_cache_path
+
+    # 1. Many deletes of missing valid IDs must not grow bookkeeping at all (0 entries admitted)
+    initial_len = len(_REDACTION_SESSION_GEN)
+    for i in range(5000):
+        assert delete_redaction_session_cache(f"missing_{i}") is False
+    assert len(_REDACTION_SESSION_GEN) == initial_len
+    assert not any(k.startswith("missing_") for k in _REDACTION_SESSION_GEN)
+
+    # 2. Heavy churn of existing sessions must stay strictly bounded by _MAX_REDACTION_GEN_CAP
+    cap = 25
+    monkeypatch.setattr("api.helpers._MAX_REDACTION_GEN_CAP", cap)
+
+    for i in range(100):
+        sid = f"churn_{i}"
+        p = _redact_session_cache_path(sid)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{}", encoding="utf-8")
+        assert delete_redaction_session_cache(sid) is True
+    assert len(_REDACTION_SESSION_GEN) <= cap
+
+
+def test_paused_predelete_writer_cannot_publish_across_reclamation_bound(state_dir, monkeypatch):
+    import threading
+    from api.helpers import (
+        _redact_session_cache_path,
+        _redact_messages,
+        _REDACTION_SESSION_GEN,
+        _REDACTION_IN_FLIGHT,
+        delete_redaction_session_cache,
+    )
+
+    cap = 10
+    monkeypatch.setattr("api.helpers._MAX_REDACTION_GEN_CAP", cap)
+
+    sid = "sessPausedWriterBound"
+    path = _redact_session_cache_path(sid)
+
+    # Populate initial cache
+    redact_session_lists_cached(sid, {"messages": _msgs()})
+    assert path.exists()
+
+    # Intercept pre-publication redaction to simulate a paused in-flight writer
+    entered_redaction = threading.Event()
+    churn_done = threading.Event()
+    real_redact_messages = _redact_messages
+
+    def slow_redact_messages(*args, **kwargs):
+        entered_redaction.set()
+        churn_done.wait(timeout=5.0)
+        return real_redact_messages(*args, **kwargs)
+
+    monkeypatch.setattr("api.helpers._redact_messages", slow_redact_messages)
+
+    new_msgs = _msgs() + [{"role": "user", "content": "racing message while churn crosses bound"}]
+    writer_thread = threading.Thread(
+        target=redact_session_lists_cached,
+        args=(sid, {"messages": new_msgs}),
+    )
+    writer_thread.start()
+
+    assert entered_redaction.wait(timeout=5.0)
+    assert _REDACTION_IN_FLIGHT.get(sid, 0) == 1
+
+    # Delete the target session while writer is paused
+    assert delete_redaction_session_cache(sid) is True
+    assert not path.exists()
+    assert sid in _REDACTION_SESSION_GEN
+
+    # Heavily cross the reclamation cap with other deleted sessions
+    for i in range(50):
+        other_sid = f"other_{i}"
+        p = _redact_session_cache_path(other_sid)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{}", encoding="utf-8")
+        delete_redaction_session_cache(other_sid)
+
+    # Target session must NOT have been evicted because its writer is still in-flight
+    assert sid in _REDACTION_SESSION_GEN
+    assert len(_REDACTION_SESSION_GEN) <= cap + 1
+
+    # Resume the paused writer
+    churn_done.set()
+    writer_thread.join(timeout=5.0)
+    assert not writer_thread.is_alive()
+
+    # Stale writer must NOT have published the cache file
+    assert not path.exists()
+
+    # Positive control: subsequent recreation works
+    monkeypatch.setattr("api.helpers._redact_messages", real_redact_messages)
+    out_recreated = redact_session_lists_cached(sid, {"messages": new_msgs})
+    assert path.exists()
+    cached = json.loads(path.read_text(encoding="utf-8"))
+    assert [m["content"] for m in cached["lists"]["messages"]] == [m["content"] for m in out_recreated["messages"]]
+
 
 
 

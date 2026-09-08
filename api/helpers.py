@@ -1618,8 +1618,26 @@ def _redact_session_cache_rules_key() -> str | None:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
-_REDACTION_SESSION_GEN: dict[str, int] = {}
+_REDACTION_SESSION_GEN: collections.OrderedDict[str, int] = collections.OrderedDict()
+_REDACTION_IN_FLIGHT: dict[str, int] = {}
+_MAX_REDACTION_GEN_CAP = 1024
 _DELETED_REDACTION_LOCK = threading.RLock()
+
+
+def _reclaim_redaction_generations_locked():
+    """Evict oldest entries from _REDACTION_SESSION_GEN that have no active in-flight operations."""
+    if len(_REDACTION_SESSION_GEN) <= _MAX_REDACTION_GEN_CAP:
+        return
+    to_delete = []
+    excess = len(_REDACTION_SESSION_GEN) - _MAX_REDACTION_GEN_CAP
+    for sid in _REDACTION_SESSION_GEN:
+        if _REDACTION_IN_FLIGHT.get(sid, 0) == 0:
+            to_delete.append(sid)
+            if len(to_delete) >= excess:
+                break
+    for sid in to_delete:
+        del _REDACTION_SESSION_GEN[sid]
+
 
 
 def _redact_session_cache_path(session_id):
@@ -1679,11 +1697,13 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
     wrote = False
     path = None
     start_token = None
+    sid_str = None
     try:
         rules_key = _redact_session_cache_rules_key()
         path = _redact_session_cache_path(session_id)
         sid_str = str(session_id)
         with _DELETED_REDACTION_LOCK:
+            _REDACTION_IN_FLIGHT[sid_str] = _REDACTION_IN_FLIGHT.get(sid_str, 0) + 1
             start_token = _REDACTION_SESSION_GEN.get(sid_str, 0)
         cache = None
         # A valid rules_key is a HARD prerequisite for authorizing a cached read.
@@ -1768,6 +1788,15 @@ def redact_session_lists_cached(session_id, lists: dict, *, _active_turn_token=N
             key: _redact_messages(items, _enabled=_enabled, _active_turn_token=_active_turn_token)
             for key, items in lists.items()
         }
+    finally:
+        if sid_str is not None:
+            with _DELETED_REDACTION_LOCK:
+                cur = _REDACTION_IN_FLIGHT.get(sid_str, 0) - 1
+                if cur <= 0:
+                    _REDACTION_IN_FLIGHT.pop(sid_str, None)
+                    _reclaim_redaction_generations_locked()
+                else:
+                    _REDACTION_IN_FLIGHT[sid_str] = cur
 
 
 def delete_redaction_session_cache(session_id) -> bool:
@@ -1800,7 +1829,12 @@ def delete_redaction_session_cache(session_id) -> bool:
         pass
     try:
         with _DELETED_REDACTION_LOCK:
-            _REDACTION_SESSION_GEN[sid_str] = _REDACTION_SESSION_GEN.get(sid_str, 0) + 1
+            file_exists = path.exists()
+            has_in_flight = _REDACTION_IN_FLIGHT.get(sid_str, 0) > 0
+            if file_exists or has_in_flight:
+                _REDACTION_SESSION_GEN[sid_str] = _REDACTION_SESSION_GEN.get(sid_str, 0) + 1
+                _REDACTION_SESSION_GEN.move_to_end(sid_str)
+                _reclaim_redaction_generations_locked()
         if not path.exists():
             return False
         path.unlink(missing_ok=True)
