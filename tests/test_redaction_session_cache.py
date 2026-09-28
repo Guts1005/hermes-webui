@@ -303,7 +303,7 @@ def test_monotonic_generation_prevents_aba_republication(state_dir):
 
 
 def test_distinct_session_deletes_leave_generation_bookkeeping_bounded(state_dir, monkeypatch):
-    from api.helpers import _REDACTION_SESSION_GEN, _MAX_REDACTION_GEN_CAP, delete_redaction_session_cache, _redact_session_cache_path
+    from api.helpers import _REDACTION_SESSION_GEN, delete_redaction_session_cache, _redact_session_cache_path
 
     # 1. Many deletes of missing valid IDs must not grow bookkeeping at all (0 entries admitted)
     initial_len = len(_REDACTION_SESSION_GEN)

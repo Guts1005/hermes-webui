@@ -131,8 +131,14 @@ def test_byte_budget_lru_eviction_and_accounting():
     tight_cache(e1)
     tight_cache(e2)
     assert tight_cache.cache_info().currsize == 2
-    # Exact shallow growth matches 658 bytes
-    assert tight_cache.cache_info().retained_bytes == 658
+    # Exact shallow growth matches dynamic container sizing across Python versions
+    expected_bytes_2_entries = (
+        sys.getsizeof(e1)
+        + sys.getsizeof(e2)
+        + (2 * H._TUPLE_OVERHEAD_BYTES)
+        + (sys.getsizeof(tight_cache._data) - H._BASE_DICT_BYTES)
+    )
+    assert tight_cache.cache_info().retained_bytes == expected_bytes_2_entries
     assert tight_cache.cache_info().retained_bytes <= 700
 
     # Access e1 again to make e2 the LRU
