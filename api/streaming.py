@@ -2714,6 +2714,24 @@ def _extract_gateway_routing_metadata(agent, result, requested_model=None, reque
     return None
 
 
+def _capture_turn_served_model(s, agent) -> str | None:
+    """Capture the model that actually served this turn onto the session.
+
+    #6068: the served model must be read AFTER agent.run: the agent
+    mutates agent.model when a fallback fires, so the pre-run
+    resolved_model would mis-attribute exactly the turns where
+    attribution matters most.
+    The configured selection is not proof that it served this turn.
+    Sets s.last_used_model from observed agent.model only, and to None
+    when nothing was observed.
+    """
+    _observed = getattr(agent, 'model', None)
+    _used = _observed.strip() if isinstance(_observed, str) else None
+    if s is not None:
+        s.last_used_model = (_used[:240]) if _used else None
+    return _used
+
+
 def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, session_id: str, profile_home: str) -> dict:
     """Build thread-local agent env with per-run values overriding profile defaults.
 
@@ -11943,13 +11961,12 @@ def _run_agent_streaming(
                     requested_model=resolved_model or model,
                     requested_provider=_session_requested_provider or resolved_provider,
                 )
-                # #6068: the served model must be read AFTER agent.run — the agent
+                # #6068: the served model must be read AFTER agent.run: the agent
                 # mutates agent.model when a fallback fires, so the pre-run
                 # resolved_model would mis-attribute exactly the turns where
                 # attribution matters most.
-                _used_model = getattr(agent, 'model', None) or resolved_model or model
-                if _used_model:
-                    s.last_used_model = str(_used_model).strip()[:240]
+                # The configured selection is not proof that it served this turn.
+                _used_model = _capture_turn_served_model(s, agent)
                 if _gateway_routing:
                     s.gateway_routing = _gateway_routing
                     _history = list(getattr(s, 'gateway_routing_history', None) or [])

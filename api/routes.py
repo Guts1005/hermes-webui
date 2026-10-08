@@ -8036,6 +8036,7 @@ def _invalidate_session_route_state_if_changed(
     model: str | None,
     provider: str | None = None,
     provider_specified: bool = True,
+    already_resolved: bool = False,
 ) -> bool:
     """Normalize and update requested route, clearing route-derived state if changed.
 
@@ -8047,11 +8048,15 @@ def _invalidate_session_route_state_if_changed(
     old_model = getattr(session, "model", None)
     old_provider = getattr(session, "model_provider", None)
 
-    norm_model, norm_provider = _session_model_state_from_request(
-        model,
-        provider if provider_specified else None,
-        current_provider=old_provider if not provider_specified else None,
-    )
+    if already_resolved:
+        norm_model = model
+        norm_provider = provider
+    else:
+        norm_model, norm_provider = _session_model_state_from_request(
+            model,
+            provider if provider_specified else None,
+            current_provider=old_provider if not provider_specified else None,
+        )
     if norm_model is not None:
         session.model = norm_model
     session.model_provider = norm_provider
@@ -22599,6 +22604,7 @@ def _prepare_chat_start_session_for_stream(
         model=model,
         provider=model_provider,
         provider_specified=True,
+        already_resolved=True,
     )
     s.active_stream_id = stream_id
     register_session_writeback_owner(s.session_id, stream_id)

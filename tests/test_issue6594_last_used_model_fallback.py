@@ -118,9 +118,23 @@ const S = {{
 function _gatewayProviderName(p) {{ return p ? String(p) : ''; }}
 function _compactComposerModelChipLabel(id, label) {{ return label || id; }}
 function _selectedModelOption() {{ return null; }}
-let _selectModelProviders = {{}};
+let _selectModelProviders = {{
+  '@custom:backup:gpt-4o': {{ model: 'gpt-4o', model_provider: 'custom:backup' }},
+  '@openrouter:gpt-5.5': {{ model: 'gpt-5.5', model_provider: 'openrouter' }}
+}};
 function _modelStateForSelect(sel, v) {{
-  const prov = (sel && sel._selectedProvider !== undefined) ? sel._selectedProvider : (_selectModelProviders[v] || null);
+  if (v && _selectModelProviders[v]) {{
+    return _selectModelProviders[v];
+  }}
+  if (typeof v === 'string' && v.startsWith('@')) {{
+    const lastColon = v.lastIndexOf(':');
+    if (lastColon !== -1) {{
+      const prov = v.slice(1, lastColon);
+      const bare = v.slice(lastColon + 1);
+      return {{ model: bare, model_provider: prov }};
+    }}
+  }}
+  const prov = (sel && sel._selectedProvider !== undefined) ? sel._selectedProvider : null;
   return {{ model: v, model_provider: prov }};
 }}
 function _ensureModelOptionInDropdown(v, sel, provider) {{
@@ -217,21 +231,44 @@ def test_sidebar_session_response_fields_allowlists_last_used_model():
 
 def test_streaming_post_run_hook_updates_last_used_model_without_mutating_session_model():
     """Post-run agent model capture sets s.last_used_model and preserves s.model."""
+    from api.streaming import _capture_turn_served_model
+
+    # 1. Fake agent with model = "claude-3-haiku" sets last_used_model and preserves requested model
     s = Session(session_id="post_run_test", model="claude-3-5-sonnet")
 
     class MockAgent:
         model = "claude-3-haiku"
 
     agent = MockAgent()
-    resolved_model = "claude-3-5-sonnet"
-    model = "claude-3-5-sonnet"
-
-    _used_model = getattr(agent, "model", None) or resolved_model or model
-    if _used_model:
-        s.last_used_model = str(_used_model).strip()[:240]
-
+    used = _capture_turn_served_model(s, agent)
+    assert used == "claude-3-haiku"
     assert s.last_used_model == "claude-3-haiku"
     assert s.model == "claude-3-5-sonnet"
+
+    # 2. Fake agent with model = None leaves last_used_model as None
+    s_none = Session(session_id="post_run_none", model="claude-3-5-sonnet")
+    agent_none = MockAgent()
+    agent_none.model = None
+    used_none = _capture_turn_served_model(s_none, agent_none)
+    assert used_none is None
+    assert s_none.last_used_model is None
+    assert s_none.model == "claude-3-5-sonnet"
+
+    # 3. Fake agent without .model attribute leaves last_used_model as None
+    s_missing = Session(session_id="post_run_missing", model="claude-3-5-sonnet")
+    used_missing = _capture_turn_served_model(s_missing, object())
+    assert used_missing is None
+    assert s_missing.last_used_model is None
+    assert s_missing.model == "claude-3-5-sonnet"
+
+    # 4. Fake agent with non-string .model attribute leaves last_used_model as None
+    s_non_str = Session(session_id="post_run_non_str", model="claude-3-5-sonnet")
+    agent_non_str = MockAgent()
+    agent_non_str.model = 12345
+    used_non_str = _capture_turn_served_model(s_non_str, agent_non_str)
+    assert used_non_str is None
+    assert s_non_str.last_used_model is None
+    assert s_non_str.model == "claude-3-5-sonnet"
 
 
 def test_sidebar_model_resolution_observable_precedence():
@@ -832,4 +869,53 @@ console.log(JSON.stringify(out));
     assert results["case5_different_provider_rejection"]["routing_match"] is False
     assert results["case5_different_provider_rejection"]["chip"] == "Model(gpt-4o)"
     assert results["case5_different_provider_rejection"]["sidebar"] == "Model(gpt-4o)"
+
+
+def test_composer_chip_matches_provider_qualified_picker_values():
+    """Verify composer chip derives bare model from provider-qualified dropdown values.
+
+    When picker value is '@custom:backup:gpt-4o' or '@openrouter:gpt-5.5',
+    the route guard recognizes that the bare model matches the session model,
+    activating the fallback attribution instead of resetting to raw value.
+    """
+    raw_output = _production_event_harness("""
+const res = [];
+
+// Case 1: @custom:backup:gpt-4o with session model 'gpt-4o'
+S.session = {
+  session_id: 'custom_prov_1',
+  model: 'gpt-4o',
+  model_provider: 'custom:backup',
+  last_used_model: 'gpt-4o-mini',
+  gateway_routing: null,
+  gateway_routing_history: []
+};
+elements.modelSelect.value = '@custom:backup:gpt-4o';
+syncModelChip();
+res.push({
+  case: 'custom_backup',
+  label: elements.composerModelLabel.textContent
+});
+
+// Case 2: @openrouter:gpt-5.5 with session model 'gpt-5.5'
+S.session = {
+  session_id: 'openrouter_prov_1',
+  model: 'gpt-5.5',
+  model_provider: 'openrouter',
+  last_used_model: 'gpt-5-mini',
+  gateway_routing: null,
+  gateway_routing_history: []
+};
+elements.modelSelect.value = '@openrouter:gpt-5.5';
+syncModelChip();
+res.push({
+  case: 'openrouter',
+  label: elements.composerModelLabel.textContent
+});
+
+console.log(JSON.stringify(res));
+""")
+    results = {item["case"]: item["label"] for item in json.loads(raw_output)}
+    assert results["custom_backup"] == "Model(gpt-4o-mini)"
+    assert results["openrouter"] == "Model(gpt-5-mini)"
 

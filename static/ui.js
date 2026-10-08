@@ -4018,7 +4018,11 @@ function syncModelChip(){
   const text=opt?opt.textContent:getModelLabel(sel.value||'');
   const compactText=_compactComposerModelChipLabel(sel.value||'', text);
   const gatewayRouting=_latestGatewayRoutingForSession(S.session);
-  const routeMatches=!S.session||!S.session.model||String(sel.value||'')===String(S.session.model||'');
+  const pickerState=(typeof _modelStateForSelect==='function')
+    ? _modelStateForSelect(sel, sel.value)
+    : { model: sel.value||'', model_provider: null };
+  const pickerModel=pickerState.model||sel.value||'';
+  const routeMatches=!S.session||!S.session.model||String(pickerModel)===String(S.session.model||'');
   const activeRouting=routeMatches?gatewayRouting:null;
   const fallbackModel=(routeMatches&&S.session&&S.session.last_used_model)?S.session.last_used_model:(sel.value||'');
   const fallbackText=(routeMatches&&S.session&&S.session.last_used_model)
@@ -7544,13 +7548,38 @@ function _gatewayModelWarningText(routing){
   const used=getModelLabel(routing.used_model||'served model');
   return`Model switched: ${requested} → ${used}`;
 }
+function _canonicalModelForCompare(val){
+  if(!val) return '';
+  let str=String(val).trim().toLowerCase();
+  const colonIdx=str.lastIndexOf(':');
+  if(colonIdx!==-1) str=str.slice(colonIdx+1);
+  const slashIdx=str.lastIndexOf('/');
+  if(slashIdx!==-1) str=str.slice(slashIdx+1);
+  return str;
+}
+
 function _latestGatewayRoutingForSession(session){
   if(!session)return null;
   const fromHistory=!session.gateway_routing;
   const routing=session.gateway_routing||(Array.isArray(session.gateway_routing_history)&&session.gateway_routing_history.length?session.gateway_routing_history[session.gateway_routing_history.length-1]:null);
   if(!routing)return null;
-  if(routing.requested_model&&session.model&&String(routing.requested_model)!==String(session.model)){
-    return null;
+  const _canonical=(typeof _canonicalModelForCompare==='function')
+    ? _canonicalModelForCompare
+    : (val)=>{
+        if(!val) return '';
+        let str=String(val).trim().toLowerCase();
+        const colonIdx=str.lastIndexOf(':');
+        if(colonIdx!==-1) str=str.slice(colonIdx+1);
+        const slashIdx=str.lastIndexOf('/');
+        if(slashIdx!==-1) str=str.slice(slashIdx+1);
+        return str;
+      };
+  if(routing.requested_model&&session.model){
+    const reqModel=_canonical(routing.requested_model);
+    const sessModel=_canonical(session.model);
+    if(reqModel&&sessModel&&reqModel!==sessModel){
+      return null;
+    }
   }
   // Canonical provider identity matching: case-insensitive, preserves legacy/empty
   const reqProvider=String(routing.requested_provider||'').trim().toLowerCase();
