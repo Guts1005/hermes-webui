@@ -4022,7 +4022,18 @@ function syncModelChip(){
     ? _modelStateForSelect(sel, sel.value)
     : { model: sel.value||'', model_provider: null };
   const pickerModel=pickerState.model||sel.value||'';
-  const routeMatches=!S.session||!S.session.model||String(pickerModel)===String(S.session.model||'');
+  const _bareRouteModel=(v)=>{
+    const s=String(v||'').trim();
+    const p=(typeof _providerFromModelValue==='function')?String(_providerFromModelValue(s)||''):'';
+    const pre=p?`@${p}:`:'';
+    return (pre&&s.toLowerCase().startsWith(pre.toLowerCase()))?s.slice(pre.length):s;
+  };
+  const _pickerProv=String(pickerState.model_provider||'').trim().toLowerCase();
+  const _sessProv=String((S.session&&S.session.model_provider)||'').trim().toLowerCase();
+  const routeMatches=!S.session||!S.session.model||(
+    _bareRouteModel(pickerModel).toLowerCase()===_bareRouteModel(S.session.model).toLowerCase()
+    &&(!_pickerProv||!_sessProv||_pickerProv===_sessProv)
+  );
   const activeRouting=routeMatches?gatewayRouting:null;
   const fallbackModel=(routeMatches&&S.session&&S.session.last_used_model)?S.session.last_used_model:(sel.value||'');
   const fallbackText=(routeMatches&&S.session&&S.session.last_used_model)
@@ -7582,11 +7593,11 @@ function _latestGatewayRoutingForSession(session){
     }
   }
   // Canonical provider identity matching: case-insensitive, preserves legacy/empty
-  const reqProvider=String(routing.requested_provider||'').trim().toLowerCase();
+  const routeProvider=String((routing.requested_route_provider!==undefined?routing.requested_route_provider:routing.requested_provider)||'').trim().toLowerCase();
   const sessProvider=String(session.model_provider||'').trim().toLowerCase();
   // Fail closed on provider-less history candidate when active route has an explicit provider
-  if(fromHistory && sessProvider && !reqProvider) return null;
-  if(reqProvider && sessProvider && reqProvider !== sessProvider) return null;
+  if(fromHistory && sessProvider && !routeProvider) return null;
+  if(routeProvider && sessProvider && routeProvider !== sessProvider) return null;
   return routing;
 }
 
@@ -12603,7 +12614,9 @@ function _applyTransparentRowFading(turn){
   const rows=Array.from(blocks.querySelectorAll(':scope > .transparent-event-row'));
   const isLive=turn.id==='liveAssistantTurn'||turn.getAttribute('data-live-assistant-turn')==='1';
   if(!isLive){
-    rows.forEach(row=>row.removeAttribute('data-transparent-fade'));
+    rows.forEach(row=>{
+      if(row.hasAttribute('data-transparent-fade')) row.removeAttribute('data-transparent-fade');
+    });
     return;
   }
   const total=rows.length;
@@ -12611,9 +12624,15 @@ function _applyTransparentRowFading(turn){
     const row=rows[i];
     // Newest = full opacity; each step back drops by 1 (floors at 5).
     const stepsFromEnd=total-1-i;
-    if(stepsFromEnd<=0){row.removeAttribute('data-transparent-fade');continue;}
+    if(stepsFromEnd<=0){
+      if(row.hasAttribute('data-transparent-fade')) row.removeAttribute('data-transparent-fade');
+      continue;
+    }
     const step=Math.min(5,stepsFromEnd);
-    row.setAttribute('data-transparent-fade',String(step));
+    const stepStr=String(step);
+    if(row.getAttribute('data-transparent-fade')!==stepStr){
+      row.setAttribute('data-transparent-fade',stepStr);
+    }
   }
 }
 // Resolve the assistant message that carries a transparent turn's settled
@@ -12691,7 +12710,10 @@ function _renderTransparentTurnFooter(turn, opts){
       turn.appendChild(footer);
     }
   }
-  footer.innerHTML=html.replace(/^<div class="transparent-turn-footer">|<\/div>$/g,'');
+  const targetHtml=html.replace(/^<div class="transparent-turn-footer">|<\/div>$/g,'');
+  if(footer.innerHTML!==targetHtml){
+    footer.innerHTML=targetHtml;
+  }
 }
 // ── Activity-group user expand intent (#1298) ──────────────────────────────
 // When the user manually expands the live "Activity" dropdown during streaming,
@@ -18128,7 +18150,15 @@ function renderMessages(options){
         failover.textContent=failoverText;
         fragments.push(failover);
       }
-      if(gatewayText){
+      // The transparent turn footer owns the model label (.lf-model) whenever
+      // the turn has transparent event rows; skip the generic chip and gateway
+      // label there so exactly one model label renders per turn. Model sits after
+      // duration to match the transparent footer order (elapsed, model, ...).
+      const _transparentFooterOwnsModel=(usedModelText||gatewayText)&&isTransparentStream()&&row&&(()=>{
+        const blocks=_assistantTurnBlocks(row);
+        return !!(blocks&&blocks.querySelector(':scope > .transparent-event-row'));
+      })();
+      if(gatewayText&&!_transparentFooterOwnsModel){
         const gateway=document.createElement('span');
         gateway.className='msg-gateway-inline';
         gateway.textContent=gatewayText;
@@ -18140,14 +18170,6 @@ function renderMessages(options){
         duration.textContent=`Done in ${durationText}`;
         fragments.push(duration);
       }
-      // The transparent turn footer owns the model label (.lf-model) whenever
-      // the turn has transparent event rows — skip the generic chip there so
-      // exactly one model label renders per turn. Model sits after duration to
-      // match the transparent footer order (elapsed · model · …).
-      const _transparentFooterOwnsModel=usedModelText&&isTransparentStream()&&row&&(()=>{
-        const blocks=_assistantTurnBlocks(row);
-        return !!(blocks&&blocks.querySelector(':scope > .transparent-event-row'));
-      })();
       if(usedModelText&&!_transparentFooterOwnsModel){
         const usedModel=document.createElement('span');
         usedModel.className='msg-used-model-inline';
@@ -18205,9 +18227,8 @@ function renderMessages(options){
       _applyTransparentRowFading(turn);
       if(hasTransparentRows){
         // Read turn metadata from the final metadata-bearing assistant segment,
-        // not querySelector's first match — a tool turn's activity segment
-        // precedes the answer, and the metadata lives on the last message
-        // (#6068 gate round 2: multi-segment turns lost the model label).
+        // not querySelector's first match: a tool turn's activity segment
+        // precedes the answer, and the metadata lives on the last message.
         const msg=_transparentTurnMetaMessage(turn);
         let durationText='';
         let modelText='';
@@ -18217,6 +18238,10 @@ function renderMessages(options){
         if(msg){
           if(msg._turnDuration!=null) durationText=_formatTurnDuration(msg._turnDuration);
           modelText=_usedModelTurnChipLabel(msg);
+          const routing=msg._gatewayRouting;
+          if(routing&&typeof _formatGatewayModelLabel==='function'){
+            modelText=_formatGatewayModelLabel(String(msg._usedModel||'').trim()||(S.session&&S.session.model)||'', '', routing)||modelText;
+          }
           if(modelText) modelTitle=String(msg._usedModel||'').trim();
           if(msg._firstTokenMs!=null) ttftText=_formatFirstToken(msg._firstTokenMs);
           if(msg._turnUsage){

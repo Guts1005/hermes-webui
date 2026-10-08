@@ -8055,7 +8055,7 @@ def _invalidate_session_route_state_if_changed(
         norm_model, norm_provider = _session_model_state_from_request(
             model,
             provider if provider_specified else None,
-            current_provider=old_provider if not provider_specified else None,
+            current_provider=old_provider,
         )
     if norm_model is not None:
         session.model = norm_model

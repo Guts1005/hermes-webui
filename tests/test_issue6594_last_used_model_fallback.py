@@ -81,6 +81,7 @@ def _production_event_harness(eval_code: str) -> str:
     boot_source = BOOT_JS.read_text(encoding="utf-8")
     sessions_source = SESSIONS_JS.read_text(encoding="utf-8")
 
+    fn_provider_from_model_value = _extract_function(ui_source, "_providerFromModelValue")
     fn_gateway_routing_label = _extract_function(ui_source, "_gatewayRoutingLabel")
     fn_format_gateway_model_label = _extract_function(ui_source, "_formatGatewayModelLabel")
     fn_latest_gateway_routing = _extract_function(ui_source, "_latestGatewayRoutingForSession")
@@ -119,8 +120,8 @@ function _gatewayProviderName(p) {{ return p ? String(p) : ''; }}
 function _compactComposerModelChipLabel(id, label) {{ return label || id; }}
 function _selectedModelOption() {{ return null; }}
 let _selectModelProviders = {{
-  '@custom:backup:gpt-4o': {{ model: 'gpt-4o', model_provider: 'custom:backup' }},
-  '@openrouter:gpt-5.5': {{ model: 'gpt-5.5', model_provider: 'openrouter' }}
+  '@custom:backup:gpt-4o': {{ model: '@custom:backup:gpt-4o', model_provider: 'custom:backup' }},
+  '@openrouter:gpt-5.5': {{ model: '@openrouter:gpt-5.5', model_provider: 'openrouter' }}
 }};
 function _modelStateForSelect(sel, v) {{
   if (v && _selectModelProviders[v]) {{
@@ -130,8 +131,7 @@ function _modelStateForSelect(sel, v) {{
     const lastColon = v.lastIndexOf(':');
     if (lastColon !== -1) {{
       const prov = v.slice(1, lastColon);
-      const bare = v.slice(lastColon + 1);
-      return {{ model: bare, model_provider: prov }};
+      return {{ model: v, model_provider: prov }};
     }}
   }}
   const prov = (sel && sel._selectedProvider !== undefined) ? sel._selectedProvider : null;
@@ -170,6 +170,7 @@ async function api(endpoint, opts) {{
   return {{}};
 }}
 
+{fn_provider_from_model_value}
 {fn_gateway_routing_label}
 {fn_format_gateway_model_label}
 {fn_latest_gateway_routing}

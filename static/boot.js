@@ -2298,19 +2298,23 @@ $('modelSelect').onchange=async()=>{
   if(typeof showToast==='function'){
     showToast(t('model_scope_toast')||'Applies to this conversation from your next message.', 3000);
   }
-  const data=await api('/api/session/update',{method:'POST',body:JSON.stringify({
-    session_id:S.session.session_id,
-    workspace:S.session.workspace,
-    model:modelState.model,
-    model_provider:modelState.model_provider||null,
+  S._modelUpdateSeq = (S._modelUpdateSeq || 0) + 1;
+  const updateSeq = S._modelUpdateSeq;
+  const targetSession = S.session;
+  const data = await api('/api/session/update', {method: 'POST', body: JSON.stringify({
+    session_id: S.session.session_id,
+    workspace: S.session.workspace,
+    model: modelState.model,
+    model_provider: modelState.model_provider || null,
   })});
+  if (S.session !== targetSession || S._modelUpdateSeq !== updateSeq) return;
   // NOTE: do NOT clear the pending explicit-pick marker here. It must survive until
   // the NEXT send() consumes it, otherwise the normal "pick → session-update → send"
   // flow loses the explicit-pick signal before /api/chat/start runs and the server
   // re-reverts a cross-family pick (the #3737 bug, Codex catch). send() clears it
   // after reading a matching pending pick. (#3739/#3737)
   _applySessionContextMetadataUpdate(data);
-  if(typeof syncModelChip==='function') syncModelChip();
+  if (typeof syncModelChip === 'function') syncModelChip();
   // Warn if selected model belongs to a different provider than what Hermes is configured for
   if(typeof _checkProviderMismatch==='function'){
     const warn=_checkProviderMismatch(selectedModel);
