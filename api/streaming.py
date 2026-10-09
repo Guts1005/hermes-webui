@@ -9494,6 +9494,7 @@ def _run_agent_streaming(
             else getattr(s, "model_provider", None)
         )
         provider_context = str(provider_context).strip().lower() if provider_context else None
+        _turn_route_provider = provider_context
         _agent_lock = _get_session_agent_lock(session_id)
         # #4251: the route layer already persisted this turn's model under the
         # session lock before dispatch, so a mismatch here means a newer picker
@@ -11966,29 +11967,34 @@ def _run_agent_streaming(
                     result,
                     requested_model=_turn_route_model or resolved_model or model,
                     requested_provider=resolved_provider,
-                    requested_route_provider=_turn_route_provider or getattr(s, 'model_provider', None) or provider_context,
+                    requested_route_provider=_turn_route_provider,
                 )
                 # #6068: the served model must be read AFTER agent.run: the agent
                 # mutates agent.model when a fallback fires, so the pre-run
                 # resolved_model would mis-attribute exactly the turns where
                 # attribution matters most.
                 # The configured selection is not proof that it served this turn.
+                # ponytail: normalize empty/whitespace to None for route equality
+                def _norm_str(v):
+                    val = str(v or '').strip().lower()
+                    return val if val else None
+
+                # ponytail: extract bare model from @provider:model using stdlib rsplit
                 def _bare_route_model(v):
                     val = str(v or '').strip().lower()
                     if val.startswith('@') and ':' in val:
-                        val = val.split(':', 1)[1]
-                    return val
+                        val = val.rsplit(':', 1)[1]
+                    return val if val else None
 
                 _route_matches = True
-                if s is not None and _turn_route_model:
+                if s is not None:
                     _cur_m = getattr(s, 'model', None)
-                    if _cur_m and _bare_route_model(_cur_m) != _bare_route_model(_turn_route_model):
+                    _cur_p = getattr(s, 'model_provider', None)
+                    _target_m = _turn_route_model or resolved_model or model
+                    if _bare_route_model(_cur_m) != _bare_route_model(_target_m):
                         _route_matches = False
-                    if _turn_route_provider is not None:
-                        _cur_p = str(getattr(s, 'model_provider', '') or '').strip().lower()
-                        _turn_p = str(_turn_route_provider or '').strip().lower()
-                        if _cur_p != _turn_p:
-                            _route_matches = False
+                    if _norm_str(_cur_p) != _norm_str(_turn_route_provider):
+                        _route_matches = False
 
                 _used_model = _capture_turn_served_model(s if _route_matches else None, agent)
                 if _gateway_routing:
