@@ -920,3 +920,65 @@ console.log(JSON.stringify(res));
     assert results["custom_backup"] == "Model(gpt-4o-mini)"
     assert results["openrouter"] == "Model(gpt-5-mini)"
 
+
+def test_named_custom_gateway_routing_no_false_failover():
+    """Named custom request with canonical used_provider does not falsely trigger failover (#7438)."""
+    from api.streaming import _extract_gateway_routing_metadata
+
+    norm = _extract_gateway_routing_metadata(
+        agent=None,
+        result={"used_model": "llama-local-q4", "used_provider": "custom"},
+        requested_model="llama-local",
+        requested_provider="custom",
+        requested_route_provider="custom:backup",
+    )
+    assert norm is not None
+    assert norm["used_provider"] == "custom"
+    assert norm["requested_provider"] == "custom"
+    assert norm["requested_route_provider"] == "custom:backup"
+    assert norm["provider_changed"] is False
+    assert norm["has_failover"] is False
+
+
+def test_legacy_saved_routing_preserves_via_attribution_for_named_custom_and_aliases():
+    """Existing saved metadata lacking requested_route_provider preserves via attribution (#7438)."""
+    script = """
+const res = {};
+
+// Case 1: Legacy session.gateway_routing with custom:backup and requested_provider custom
+const legacyCustomSession = {
+  model: 'llama-local',
+  model_provider: 'custom:backup',
+  gateway_routing: {
+    requested_model: 'llama-local',
+    used_model: 'llama-local-q4',
+    requested_provider: 'custom',
+    used_provider: 'custom'
+  },
+  gateway_routing_history: []
+};
+res.legacy_active = !!_latestGatewayRoutingForSession(legacyCustomSession);
+
+// Case 2: Legacy history entry without requested_route_provider fails closed
+const legacyHistorySession = {
+  model: 'llama-local',
+  model_provider: 'custom:backup',
+  gateway_routing: null,
+  gateway_routing_history: [{
+    requested_model: 'llama-local',
+    used_model: 'llama-local-q4',
+    requested_provider: 'custom',
+    used_provider: 'custom'
+  }]
+};
+res.legacy_history = !!_latestGatewayRoutingForSession(legacyHistorySession);
+
+console.log(JSON.stringify(res));
+"""
+    results = json.loads(_production_event_harness(script))
+    # Active legacy routing preserves working attribution
+    assert results["legacy_active"] is True
+    # Conservative history filtering fails closed
+    assert results["legacy_history"] is False
+
+

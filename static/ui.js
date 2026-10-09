@@ -7593,11 +7593,16 @@ function _latestGatewayRoutingForSession(session){
     }
   }
   // Canonical provider identity matching: case-insensitive, preserves legacy/empty
-  const routeProvider=String((routing.requested_route_provider!==undefined?routing.requested_route_provider:routing.requested_provider)||'').trim().toLowerCase();
+  const hasExplicitRoute=routing.requested_route_provider!==undefined&&routing.requested_route_provider!==null&&String(routing.requested_route_provider).trim()!=='';
   const sessProvider=String(session.model_provider||'').trim().toLowerCase();
-  // Fail closed on provider-less history candidate when active route has an explicit provider
-  if(fromHistory && sessProvider && !routeProvider) return null;
-  if(routeProvider && sessProvider && routeProvider !== sessProvider) return null;
+  if(hasExplicitRoute){
+    const routeProvider=String(routing.requested_route_provider).trim().toLowerCase();
+    if(sessProvider && routeProvider && routeProvider !== sessProvider) return null;
+  } else if(fromHistory){
+    const reqProvider=String(routing.requested_provider||'').trim().toLowerCase();
+    // Fail closed on provider-less history candidate when active route has an explicit provider
+    if(sessProvider && (!reqProvider || reqProvider !== sessProvider)) return null;
+  }
   return routing;
 }
 

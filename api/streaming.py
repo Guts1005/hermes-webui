@@ -11964,18 +11964,36 @@ def _run_agent_streaming(
                 _gateway_routing = _extract_gateway_routing_metadata(
                     agent,
                     result,
-                    requested_model=resolved_model or model,
-                    requested_provider=_session_requested_provider or resolved_provider,
-                    requested_route_provider=getattr(s, 'model_provider', None) or provider_context,
+                    requested_model=_turn_route_model or resolved_model or model,
+                    requested_provider=resolved_provider,
+                    requested_route_provider=_turn_route_provider or getattr(s, 'model_provider', None) or provider_context,
                 )
                 # #6068: the served model must be read AFTER agent.run: the agent
                 # mutates agent.model when a fallback fires, so the pre-run
                 # resolved_model would mis-attribute exactly the turns where
                 # attribution matters most.
                 # The configured selection is not proof that it served this turn.
-                _used_model = _capture_turn_served_model(s, agent)
+                def _bare_route_model(v):
+                    val = str(v or '').strip().lower()
+                    if val.startswith('@') and ':' in val:
+                        val = val.split(':', 1)[1]
+                    return val
+
+                _route_matches = True
+                if s is not None and _turn_route_model:
+                    _cur_m = getattr(s, 'model', None)
+                    if _cur_m and _bare_route_model(_cur_m) != _bare_route_model(_turn_route_model):
+                        _route_matches = False
+                    if _turn_route_provider is not None:
+                        _cur_p = str(getattr(s, 'model_provider', '') or '').strip().lower()
+                        _turn_p = str(_turn_route_provider or '').strip().lower()
+                        if _cur_p != _turn_p:
+                            _route_matches = False
+
+                _used_model = _capture_turn_served_model(s if _route_matches else None, agent)
                 if _gateway_routing:
-                    s.gateway_routing = _gateway_routing
+                    if _route_matches:
+                        s.gateway_routing = _gateway_routing
                     _history = list(getattr(s, 'gateway_routing_history', None) or [])
                     _history.append(_gateway_routing)
                     s.gateway_routing_history = _history[-50:]
