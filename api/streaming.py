@@ -45,6 +45,7 @@ from api.config import (
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
     resolve_custom_provider_connection,
+    _parse_provider_qualified_model_id,
     model_with_provider_context,
     warm_models_catalog_provenance_if_cold,
     load_settings,
@@ -9514,6 +9515,8 @@ def _run_agent_streaming(
                 _last_persisted_model = model
                 _last_persisted_provider = provider_context
                 _turn_owns_persisted_model = True
+                _turn_route_model = model
+                _turn_route_provider = provider_context
 
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
         # Check for pre-flight cancel (user cancelled before agent even started)
@@ -9577,6 +9580,11 @@ def _run_agent_streaming(
                 s.model_provider = provider_context
                 if _repaired and model != (s.model or ""):
                     s.model = model
+                _last_persisted_model = s.model
+                _last_persisted_provider = s.model_provider
+                # ponytail: finalize route snapshot when profile normalization is accepted
+                _turn_route_model = s.model
+                _turn_route_provider = s.model_provider
 
         # Capture the resolved profile name now, while profile context is
         # reliable. Used in the compression migration block to stamp s.profile
@@ -11979,12 +11987,15 @@ def _run_agent_streaming(
                     val = str(v or '').strip().lower()
                     return val if val else None
 
-                # ponytail: extract bare model from @provider:model using stdlib rsplit
+                # ponytail: reuse shared parser for @provider:model tags
                 def _bare_route_model(v):
-                    val = str(v or '').strip().lower()
+                    val = str(v or '').strip()
                     if val.startswith('@') and ':' in val:
-                        val = val.rsplit(':', 1)[1]
-                    return val if val else None
+                        parsed = _parse_provider_qualified_model_id(val)
+                        if parsed:
+                            return parsed[0].strip().lower()
+                        return val.split(':', 1)[1].strip().lower()
+                    return val.lower() if val else None
 
                 _route_matches = True
                 if s is not None:

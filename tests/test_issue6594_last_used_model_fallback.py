@@ -988,21 +988,21 @@ console.log(JSON.stringify(res));
     assert results["legacy_history"] is False
 
 
-# ponytail: minimal worker turn harness verifying mid-turn route changes (#7438)
+# ponytail: isolated worker turn harness verifying route lifecycle (#7438)
 class _WorkerTestSession:
-    def __init__(self, *, model, model_provider=None):
-        self.session_id = "sess-worker-test"
+    def __init__(self, session_id, *, model, model_provider=None, profile=None):
+        self.session_id = session_id
         self.title = "Worker test"
         self.workspace = "/tmp"
         self.model = model
         self.model_provider = model_provider
+        self.profile = profile
         self.messages = []
         self.last_used_model = None
         self.gateway_routing = None
         self.gateway_routing_history = []
         self.active_stream_id = None
         self.personality = None
-        self.profile = None
         self.input_tokens = 0
         self.output_tokens = 0
         self.estimated_cost = None
@@ -1021,6 +1021,7 @@ class _WorkerTestSession:
 class _WorkerTestAgent:
     mid_turn_hook = None
     served_model = "fallback-served-model"
+    entry_count = 0
 
     def __init__(self, **kwargs):
         self.model = _WorkerTestAgent.served_model
@@ -1034,6 +1035,7 @@ class _WorkerTestAgent:
         self._last_error = None
 
     def run_conversation(self, **kwargs):
+        _WorkerTestAgent.entry_count += 1
         if _WorkerTestAgent.mid_turn_hook:
             _WorkerTestAgent.mid_turn_hook()
         return {
@@ -1056,7 +1058,10 @@ def _run_worker_test_turn(
     dispatch_provider=None,
     served_model="fallback-served-model",
     mid_turn_hook=None,
+    profile_enrichment_hook=None,
 ):
+    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+
     fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
     fake_runtime_module.resolve_runtime_provider = mock.Mock(
         return_value={"provider": "anthropic", "base_url": None, "api_key": "k"}
@@ -1084,11 +1089,20 @@ def _run_worker_test_turn(
     monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_module)
     monkeypatch.setitem(sys.modules, "hermes_state", fake_hermes_state)
 
+    if profile_enrichment_hook:
+        monkeypatch.setattr(
+            streaming,
+            "_apply_profile_home_context_to_streaming_model",
+            profile_enrichment_hook,
+        )
+
     _WorkerTestAgent.served_model = served_model
     _WorkerTestAgent.mid_turn_hook = mid_turn_hook
+    _WorkerTestAgent.entry_count = 0
 
     session.active_stream_id = stream_id
-    streaming.STREAMS[stream_id] = queue.Queue()
+    stream_q = queue.Queue()
+    streaming.STREAMS[stream_id] = stream_q
     try:
         streaming._run_agent_streaming(
             session_id=session.session_id,
@@ -1101,12 +1115,22 @@ def _run_worker_test_turn(
     finally:
         streaming.STREAMS.pop(stream_id, None)
         streaming.AGENT_INSTANCES.pop(stream_id, None)
+        with SESSION_AGENT_CACHE_LOCK:
+            SESSION_AGENT_CACHE.pop(session.session_id, None)
+
+    # Assert agent entry and no terminal error events
+    assert _WorkerTestAgent.entry_count >= 1
+    events = []
+    while not stream_q.empty():
+        events.append(stream_q.get_nowait())
+    terminal_errors = [e for e in events if isinstance(e, tuple) and e[0] == "error"]
+    assert not terminal_errors, f"Terminal stream error observed: {terminal_errors}"
 
 
 def test_worker_turn_omitted_provider_rejects_session_attribution_on_mid_turn_provider_switch(monkeypatch):
     """When turn dispatches with omitted model_provider=None, a mid-turn provider
     switch on the same model must not overwrite session-level attribution (#7438)."""
-    session = _WorkerTestSession(model="haiku-4-5", model_provider=None)
+    session = _WorkerTestSession("sess-worker-omitted-provider-race", model="haiku-4-5", model_provider=None)
 
     def _switch_provider():
         session.model_provider = "openrouter"
@@ -1132,7 +1156,7 @@ def test_worker_turn_omitted_provider_rejects_session_attribution_on_mid_turn_pr
 
 def test_worker_turn_rejects_session_attribution_on_mid_turn_model_switch(monkeypatch):
     """When session model changes mid-turn, session-level attribution is rejected (#7438)."""
-    session = _WorkerTestSession(model="haiku-4-5", model_provider="anthropic")
+    session = _WorkerTestSession("sess-worker-model-switch", model="haiku-4-5", model_provider="anthropic")
 
     def _switch_model():
         session.model = "opus-4-8"
@@ -1155,7 +1179,7 @@ def test_worker_turn_rejects_session_attribution_on_mid_turn_model_switch(monkey
 
 def test_worker_turn_rejects_session_attribution_on_mid_turn_provider_switch(monkeypatch):
     """When session provider changes mid-turn, session-level attribution is rejected (#7438)."""
-    session = _WorkerTestSession(model="haiku-4-5", model_provider="anthropic")
+    session = _WorkerTestSession("sess-worker-provider-switch", model="haiku-4-5", model_provider="anthropic")
 
     def _switch_provider():
         session.model_provider = "openrouter"
@@ -1178,7 +1202,7 @@ def test_worker_turn_rejects_session_attribution_on_mid_turn_provider_switch(mon
 
 def test_worker_turn_updates_session_attribution_when_route_is_unchanged(monkeypatch):
     """When route remains unchanged during turn, session-level attribution is updated (#7438)."""
-    session = _WorkerTestSession(model="haiku-4-5", model_provider="anthropic")
+    session = _WorkerTestSession("sess-worker-unchanged-route", model="haiku-4-5", model_provider="anthropic")
 
     _run_worker_test_turn(
         monkeypatch,
@@ -1195,14 +1219,99 @@ def test_worker_turn_updates_session_attribution_when_route_is_unchanged(monkeyp
     assert asst_msg.get("_usedModel") == "haiku-fallback"
 
 
-def test_worker_turn_bare_route_matching_for_provider_qualified_picker(monkeypatch):
-    """Provider-qualified picker strings like @custom:backup:gpt-4o match session model (#7438)."""
-    session = _WorkerTestSession(model="gpt-4o", model_provider="custom:backup")
+def test_worker_turn_profile_enrichment_accepts_session_attribution(monkeypatch):
+    """When profile enriches omitted provider to anthropic, session attribution is accepted (#7438)."""
+    session = _WorkerTestSession(
+        "sess-worker-profile-enrichment",
+        model="haiku-4-5",
+        model_provider=None,
+        profile="dev-profile",
+    )
+
+    def _profile_hook(model, provider_context, profile_home, has_profile):
+        return model, "anthropic", False
 
     _run_worker_test_turn(
         monkeypatch,
         session,
-        stream_id="stream-test-bare-match",
+        stream_id="stream-test-profile-enrichment",
+        dispatch_model="haiku-4-5",
+        dispatch_provider=None,
+        served_model="haiku-fallback",
+        mid_turn_hook=None,
+        profile_enrichment_hook=_profile_hook,
+    )
+
+    assert session.last_used_model == "haiku-fallback"
+    assert session.model_provider == "anthropic"
+    asst_msg = [m for m in session.messages if m.get("role") == "assistant"][-1]
+    assert asst_msg.get("_usedModel") == "haiku-fallback"
+
+
+def test_worker_turn_profile_repair_accepts_session_attribution(monkeypatch):
+    """When profile repairs stale model to target model, session attribution is accepted (#7438)."""
+    session = _WorkerTestSession(
+        "sess-worker-profile-repair",
+        model="stale-model",
+        model_provider="anthropic",
+        profile="dev-profile",
+    )
+
+    def _profile_hook(model, provider_context, profile_home, has_profile):
+        return "repaired-haiku", provider_context, True
+
+    _run_worker_test_turn(
+        monkeypatch,
+        session,
+        stream_id="stream-test-profile-repair",
+        dispatch_model="stale-model",
+        dispatch_provider="anthropic",
+        served_model="repaired-haiku-served",
+        mid_turn_hook=None,
+        profile_enrichment_hook=_profile_hook,
+    )
+
+    assert session.last_used_model == "repaired-haiku-served"
+    assert session.model == "repaired-haiku"
+    asst_msg = [m for m in session.messages if m.get("role") == "assistant"][-1]
+    assert asst_msg.get("_usedModel") == "repaired-haiku-served"
+
+
+def test_worker_turn_openrouter_free_suffix_preserves_attribution(monkeypatch):
+    """OpenRouter qualified models with :free tag suffix preserve session attribution (#7438)."""
+    session = _WorkerTestSession(
+        "sess-worker-openrouter-free",
+        model="tencent/hy3-preview:free",
+        model_provider="openrouter",
+    )
+
+    _run_worker_test_turn(
+        monkeypatch,
+        session,
+        stream_id="stream-test-openrouter-free",
+        dispatch_model="@openrouter:tencent/hy3-preview:free",
+        dispatch_provider="openrouter",
+        served_model="tencent/hy3-preview:free-served",
+        mid_turn_hook=None,
+    )
+
+    assert session.last_used_model == "tencent/hy3-preview:free-served"
+    asst_msg = [m for m in session.messages if m.get("role") == "assistant"][-1]
+    assert asst_msg.get("_usedModel") == "tencent/hy3-preview:free-served"
+
+
+def test_worker_turn_named_custom_plain_preserves_attribution(monkeypatch):
+    """Named custom routes like @custom:backup:gpt-4o preserve session attribution (#7438)."""
+    session = _WorkerTestSession(
+        "sess-worker-custom-plain",
+        model="gpt-4o",
+        model_provider="custom:backup",
+    )
+
+    _run_worker_test_turn(
+        monkeypatch,
+        session,
+        stream_id="stream-test-custom-plain",
         dispatch_model="@custom:backup:gpt-4o",
         dispatch_provider="custom:backup",
         served_model="gpt-4o-mini",
@@ -1212,6 +1321,30 @@ def test_worker_turn_bare_route_matching_for_provider_qualified_picker(monkeypat
     assert session.last_used_model == "gpt-4o-mini"
     asst_msg = [m for m in session.messages if m.get("role") == "assistant"][-1]
     assert asst_msg.get("_usedModel") == "gpt-4o-mini"
+
+
+def test_worker_turn_named_custom_free_suffix_preserves_attribution(monkeypatch):
+    """Named custom routes with :free tag suffix preserve session attribution (#7438)."""
+    session = _WorkerTestSession(
+        "sess-worker-custom-free",
+        model="some-model:free",
+        model_provider="custom:backup",
+    )
+
+    _run_worker_test_turn(
+        monkeypatch,
+        session,
+        stream_id="stream-test-custom-free",
+        dispatch_model="@custom:backup:some-model:free",
+        dispatch_provider="custom:backup",
+        served_model="custom-served-free",
+        mid_turn_hook=None,
+    )
+
+    assert session.last_used_model == "custom-served-free"
+    asst_msg = [m for m in session.messages if m.get("role") == "assistant"][-1]
+    assert asst_msg.get("_usedModel") == "custom-served-free"
+
 
 
 
